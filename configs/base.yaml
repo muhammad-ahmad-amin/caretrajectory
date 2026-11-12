@@ -1,0 +1,21 @@
+seed: 42
+data:
+  physionet_dir: data/physionet_2019
+  mimic_dir:     data/mimic-iv-demo
+  processed_dir: data_processed
+features:
+  windows_hours: [6, 12, 24]
+  include_missingness: true
+  include_deltas: true
+split:
+  strategy: patient_level
+  train_frac: 0.7
+  val_frac:   0.15
+  test_frac:  0.15
+model:
+  type: xgboost
+  params: {}
+output:
+  experiments_dir: experiments
+  models_dir:      models
+  reports_dir:     reports
