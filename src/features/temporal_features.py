@@ -10,6 +10,8 @@ across patient ICU timelines. Grouping strictly preserves patient boundaries.
 """
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
@@ -214,12 +216,14 @@ class TemporalFeatureExtractor:
             pd.DataFrame: Feature-engineered matrix with rolling windows, deltas, and scores.
         """
         if self.patient_id_col in df.columns:
-            logger.info(f"Extracting features across patient groups (Column: '{self.patient_id_col}')...")
-            # Process each patient group independently to ensure strict boundary safety
-            patient_dfs = []
-            for pid, group in df.groupby(self.patient_id_col, sort=False):
-                patient_feats = self._extract_single_patient(group)
-                patient_dfs.append(patient_feats)
+            groups = [group for _, group in df.groupby(self.patient_id_col, sort=False)]
+            n_patients = len(groups)
+            if n_patients > 10:
+                workers = min(16, (os.cpu_count() or 4) * 2)
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    patient_dfs = list(executor.map(self._extract_single_patient, groups))
+            else:
+                patient_dfs = [self._extract_single_patient(g) for g in groups]
             
             transformed_df = pd.concat(patient_dfs, axis=0, ignore_index=True)
         else:
