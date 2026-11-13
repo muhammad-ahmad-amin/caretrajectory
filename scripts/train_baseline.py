@@ -16,7 +16,7 @@ import logging
 import os
 from pathlib import Path
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import joblib
 import numpy as np
