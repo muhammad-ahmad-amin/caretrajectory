@@ -473,7 +473,7 @@ def train_and_evaluate_baselines(
     logger.info("Training Model 1: XGBoost Gradient Boosting Classifier (Histogram Engine)...")
     xgb_params = cfg.get("models", {}).get("xgboost", {})
     xgb_model = xgb.XGBClassifier(
-        n_estimators=xgb_params.get("n_estimators", 100),
+        n_estimators=xgb_params.get("n_estimators", 50),
         learning_rate=xgb_params.get("learning_rate", 0.05),
         max_depth=xgb_params.get("max_depth", 5),
         subsample=xgb_params.get("subsample", 0.8),
@@ -483,7 +483,7 @@ def train_and_evaluate_baselines(
         eval_metric="aucpr",
         early_stopping_rounds=xgb_params.get("early_stopping_rounds", 30),
         random_state=seed,
-        n_jobs=4,
+        n_jobs=2,
     )
 
     X_train_xgb = feature_matrix.loc[train_mask, feature_cols]
