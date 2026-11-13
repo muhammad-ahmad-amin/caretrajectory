@@ -1,21 +1,120 @@
+# ==============================================================================
+# CareTrajectory — Baseline ML & Feature Engineering Configuration
+# ==============================================================================
+
 seed: 42
+
+project:
+  name: "CareTrajectory"
+  version: "1.0.0"
+  description: "Strict ML Pipeline for Patient Deterioration & Sepsis Onset Prediction"
+
 data:
-  physionet_dir: data/physionet_2019
-  mimic_dir:     data/mimic-iv-demo
-  processed_dir: data_processed
+  physionet_dir: "data/physionet_2019"
+  mimic_dir: "data/mimic-iv-demo"
+  processed_dir: "data_processed"
+  raw_file_format: "psv"
+  chunk_size: 500  # Number of patient files to process per chunk for memory control
+
 features:
+  # Multi-horizon temporal windows (in hours)
   windows_hours: [6, 12, 24]
+  
+  # Aggregations to compute for each window
+  aggregations: ["mean", "min", "max", "std"]
+  
+  # Temporal deltas (rate of change over past k hours)
+  delta_hours: [1, 3, 6]
+  
+  # Missingness & sampling dynamics
   include_missingness: true
   include_deltas: true
+  include_clinical_scores: true
+  
+  # Key physiological signals to monitor
+  vital_columns:
+    - "HR"
+    - "O2Sat"
+    - "Temp"
+    - "SBP"
+    - "MAP"
+    - "DBP"
+    - "Resp"
+    
+  lab_columns:
+    - "BaseExcess"
+    - "HCO3"
+    - "FiO2"
+    - "pH"
+    - "PaCO2"
+    - "SaO2"
+    - "AST"
+    - "BUN"
+    - "Alkalinephos"
+    - "Calcium"
+    - "Chloride"
+    - "Creatinine"
+    - "Bilirubin_direct"
+    - "Glucose"
+    - "Lactate"
+    - "Magnesium"
+    - "Phosphate"
+    - "Potassium"
+    - "Bilirubin_total"
+    - "TroponinI"
+    - "Hct"
+    - "Hgb"
+    - "PTT"
+    - "WBC"
+    - "Fibrinogen"
+    - "Platelets"
+
+  demographic_columns:
+    - "Age"
+    - "Gender"
+    - "Unit1"
+    - "Unit2"
+    - "HospAdmTime"
+    - "ICULOS"
+
 split:
-  strategy: patient_level
-  train_frac: 0.7
-  val_frac:   0.15
-  test_frac:  0.15
-model:
-  type: xgboost
-  params: {}
+  strategy: "patient_level"  # Strict grouping by patient_id
+  n_splits: 5               # 5-fold Stratified Group K-Fold cross validation
+  train_frac: 0.70
+  val_frac: 0.15
+  test_frac: 0.15
+
+models:
+  logistic_regression:
+    penalty: "l2"
+    C: 0.1
+    solver: "lbfgs"
+    max_iter: 1000
+    class_weight: "balanced"
+    random_state: 42
+    
+  xgboost:
+    n_estimators: 300
+    learning_rate: 0.05
+    max_depth: 5
+    subsample: 0.8
+    colsample_bytree: 0.8
+    tree_method: "hist"
+    eval_metric: "aucpr"
+    early_stopping_rounds: 30
+    random_state: 42
+    n_jobs: -1
+
+evaluation:
+  target_column: "SepsisLabel"
+  id_column: "patient_id"
+  time_column: "ICULOS"
+  primary_metric: "AUPRC"
+  threshold_strategy: "f1_optimal"  # or "fixed_0.5" or "recall_at_90_sens"
+  dpi: 300
+
 output:
-  experiments_dir: experiments
-  models_dir:      models
-  reports_dir:     reports
+  experiments_dir: "experiments"
+  models_dir: "models"
+  reports_dir: "reports"
+  figures_dir: "reports/figures"
