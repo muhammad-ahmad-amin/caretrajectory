@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 import yaml
 from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 import xgboost as xgb
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
