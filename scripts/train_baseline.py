@@ -1,18 +1,14 @@
 """
-scripts/train_baseline.py
-================================================================================
 CareTrajectory — Reproducible Classical ML Baseline Training & Benchmark Runner
 
 Trains and validates baseline clinical models (Logistic Regression & XGBoost)
 on ICU patient deterioration trajectories. Enforces strict patient-level grouping
 to prevent data leakage, handles class imbalance, and generates publication-grade
 evaluation artifacts and visual reports.
-================================================================================
 """
 
 import argparse
 import gc
-import glob
 import logging
 import os
 from pathlib import Path
@@ -24,15 +20,11 @@ import joblib
 import numpy as np
 import pandas as pd
 import yaml
-from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import GroupShuffleSplit
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 import xgboost as xgb
 
-# Project Imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from src.features.temporal_features import TemporalFeatureExtractor
 from src.evaluation.metrics import (
     compute_clinical_metrics,
@@ -44,12 +36,14 @@ from src.evaluation.metrics import (
     save_metrics_report,
 )
 
+
 logger = logging.getLogger("CareTrajectory.BaselineTrainer")
+
 if not logger.handlers:
     handler = logging.StreamHandler()
     formatter = logging.Formatter(
         "[%(asctime)s] [%(levelname)s] [CareTrajectory.Trainer] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
     handler.setFormatter(formatter)
     logger.addHandler(handler)
@@ -57,30 +51,32 @@ if not logger.handlers:
 
 
 # ==============================================================================
-# 1. Synthetic ICU Data Generator (For Testing & Immediate Verification)
+# 1. Synthetic ICU Data Generator
 # ==============================================================================
+
 def generate_synthetic_icu_cohort(
     n_patients: int = 120,
     seed: int = 42
 ) -> pd.DataFrame:
-    """
-    Synthesizes realistic clinical time-series for n_patients with ICU lengths of stay.
-    Simulates physiological deterioration trajectories (rising HR, falling MAP, spiking Lactate)
-    for patients that develop sepsis, mimicking PhysioNet 2019 dataset distributions.
-    """
+
     np.random.seed(seed)
     records = []
-    
+
     for pid in range(1, n_patients + 1):
+
         patient_id = f"p_{pid:05d}"
-        los = np.random.randint(18, 50)  # ICU length of stay between 18 and 50 hours
+
+        los = np.random.randint(18, 50)
         age = float(np.random.normal(63.0, 12.0))
         gender = int(np.random.choice([0, 1]))
-        is_septic = np.random.rand() < 0.12  # ~12% patient-level prevalence
-        
-        onset_hour = np.random.randint(10, los - 4) if is_septic else 9999
-        
-        # Baselines
+        is_septic = np.random.rand() < 0.12
+
+        onset_hour = (
+            np.random.randint(10, los - 4)
+            if is_septic
+            else 9999
+        )
+
         hr_base = np.random.normal(76.0, 8.0)
         map_base = np.random.normal(86.0, 9.0)
         temp_base = np.random.normal(36.9, 0.4)
@@ -89,34 +85,101 @@ def generate_synthetic_icu_cohort(
         lactate_base = np.random.normal(1.2, 0.3)
         creat_base = np.random.normal(0.9, 0.2)
         wbc_base = np.random.normal(7.5, 1.5)
-        
+
         for t in range(1, los + 1):
-            # Check if patient is in deteriorating phase
+
             if is_septic and (t >= onset_hour - 6):
-                # Escalating shock & infection trajectory
-                hrs_since_deterioration = max(0, t - (onset_hour - 6))
-                hr_val = hr_base + 3.2 * hrs_since_deterioration + np.random.normal(0, 3.0)
-                map_val = map_base - 2.8 * hrs_since_deterioration + np.random.normal(0, 3.0)
-                temp_val = temp_base + 0.18 * hrs_since_deterioration + np.random.normal(0, 0.2)
-                resp_val = resp_base + 1.1 * hrs_since_deterioration + np.random.normal(0, 1.5)
-                o2_val = max(84.0, o2_base - 0.9 * hrs_since_deterioration + np.random.normal(0, 0.8))
-                lactate_val = lactate_base + 0.35 * hrs_since_deterioration + np.random.normal(0, 0.2)
-                creat_val = creat_base + 0.12 * hrs_since_deterioration + np.random.normal(0, 0.05)
-                wbc_val = wbc_base + 0.8 * hrs_since_deterioration + np.random.normal(0, 0.5)
+
+                hrs_since_deterioration = max(
+                    0,
+                    t - (onset_hour - 6)
+                )
+
+                hr_val = (
+                    hr_base
+                    + 3.2 * hrs_since_deterioration
+                    + np.random.normal(0, 3.0)
+                )
+
+                map_val = (
+                    map_base
+                    - 2.8 * hrs_since_deterioration
+                    + np.random.normal(0, 3.0)
+                )
+
+                temp_val = (
+                    temp_base
+                    + 0.18 * hrs_since_deterioration
+                    + np.random.normal(0, 0.2)
+                )
+
+                resp_val = (
+                    resp_base
+                    + 1.1 * hrs_since_deterioration
+                    + np.random.normal(0, 1.5)
+                )
+
+                o2_val = max(
+                    84.0,
+                    o2_base
+                    - 0.9 * hrs_since_deterioration
+                    + np.random.normal(0, 0.8)
+                )
+
+                lactate_val = (
+                    lactate_base
+                    + 0.35 * hrs_since_deterioration
+                    + np.random.normal(0, 0.2)
+                )
+
+                creat_val = (
+                    creat_base
+                    + 0.12 * hrs_since_deterioration
+                    + np.random.normal(0, 0.05)
+                )
+
+                wbc_val = (
+                    wbc_base
+                    + 0.8 * hrs_since_deterioration
+                    + np.random.normal(0, 0.5)
+                )
+
             else:
+
                 hr_val = hr_base + np.random.normal(0, 3.5)
                 map_val = map_base + np.random.normal(0, 4.0)
                 temp_val = temp_base + np.random.normal(0, 0.25)
                 resp_val = resp_base + np.random.normal(0, 1.5)
-                o2_val = min(100.0, max(90.0, o2_base + np.random.normal(0, 1.0)))
-                lactate_val = max(0.5, lactate_base + np.random.normal(0, 0.15))
-                creat_val = max(0.4, creat_base + np.random.normal(0, 0.08))
-                wbc_val = max(3.0, wbc_base + np.random.normal(0, 0.6))
-                
-            # Ground truth label (active sepsis)
-            label = 1 if (is_septic and t >= onset_hour) else 0
-            
-            # Simulate clinical lab missingness (labs drawn periodically, not hourly)
+
+                o2_val = min(
+                    100.0,
+                    max(
+                        90.0,
+                        o2_base + np.random.normal(0, 1.0)
+                    )
+                )
+
+                lactate_val = max(
+                    0.5,
+                    lactate_base + np.random.normal(0, 0.15)
+                )
+
+                creat_val = max(
+                    0.4,
+                    creat_base + np.random.normal(0, 0.08)
+                )
+
+                wbc_val = max(
+                    3.0,
+                    wbc_base + np.random.normal(0, 0.6)
+                )
+
+            label = (
+                1
+                if (is_septic and t >= onset_hour)
+                else 0
+            )
+
             row = {
                 "patient_id": patient_id,
                 "ICULOS": t,
@@ -129,102 +192,238 @@ def generate_synthetic_icu_cohort(
                 "Temp": max(34.0, min(41.5, temp_val)),
                 "Resp": max(8.0, min(45.0, resp_val)),
                 "O2Sat": max(70.0, min(100.0, o2_val)),
-                "FiO2": 0.40 if (t % 8 == 0 or (is_septic and t >= onset_hour - 3)) else np.nan,
-                "Lactate": lactate_val if (t % 6 == 0 or (is_septic and t >= onset_hour - 4)) else np.nan,
-                "Creatinine": creat_val if (t % 12 == 0) else np.nan,
-                "BUN": (creat_val * 15.0) if (t % 12 == 0) else np.nan,
-                "WBC": wbc_val if (t % 12 == 0) else np.nan,
-                "Platelets": np.random.normal(210.0, 30.0) if (t % 12 == 0) else np.nan,
+                "FiO2": (
+                    0.40
+                    if (
+                        t % 8 == 0
+                        or (is_septic and t >= onset_hour - 3)
+                    )
+                    else np.nan
+                ),
+                "Lactate": (
+                    lactate_val
+                    if (
+                        t % 6 == 0
+                        or (is_septic and t >= onset_hour - 4)
+                    )
+                    else np.nan
+                ),
+                "Creatinine": (
+                    creat_val
+                    if t % 12 == 0
+                    else np.nan
+                ),
+                "BUN": (
+                    creat_val * 15.0
+                    if t % 12 == 0
+                    else np.nan
+                ),
+                "WBC": (
+                    wbc_val
+                    if t % 12 == 0
+                    else np.nan
+                ),
+                "Platelets": (
+                    np.random.normal(210.0, 30.0)
+                    if t % 12 == 0
+                    else np.nan
+                ),
                 "SepsisLabel": label,
             }
+
             records.append(row)
-            
+
     df = pd.DataFrame(records)
-    logger.info(f"Synthesized ICU Cohort: {n_patients} patients, {len(df)} total hours, {df['SepsisLabel'].sum()} sepsis events ({df['SepsisLabel'].mean():.2%}).")
+
+    logger.info(
+        f"Synthesized ICU Cohort: {n_patients} patients, "
+        f"{len(df)} total hours, "
+        f"{df['SepsisLabel'].sum()} sepsis events "
+        f"({df['SepsisLabel'].mean():.2%})."
+    )
+
     return df
 
 
 # ==============================================================================
-# 2. Multi-Dataset Loading & Checkpointed Feature Extraction Engine
+# 2. Multi-Dataset Loading
 # ==============================================================================
+
 def discover_patient_files(
     data_sources: Union[str, Path, List[Union[str, Path]]],
     max_files: Optional[int] = None
 ) -> List[Tuple[Path, str]]:
-    """Discovers all .psv and .csv patient files across provided sources."""
+
     if isinstance(data_sources, (str, Path)):
         sources = [Path(data_sources)]
     else:
         sources = [Path(s) for s in data_sources]
 
-    all_files: List[Tuple[Path, str]] = []
+    all_files = []
+
     for src in sources:
+
         if not src.exists():
-            logger.warning(f"Data source path does not exist: {src}")
+            logger.warning(
+                f"Data source path does not exist: {src}"
+            )
             continue
-        
-        source_tag = src.name if src.is_dir() else src.parent.name
+
+        source_tag = (
+            src.name
+            if src.is_dir()
+            else src.parent.name
+        )
+
         if src.is_dir():
-            found = sorted(list(src.glob("*.psv")) + list(src.glob("**/*.psv")) +
-                           list(src.glob("*.csv")) + list(src.glob("**/*.csv")))
+
+            found = sorted(
+                list(src.glob("*.psv"))
+                + list(src.glob("**/*.psv"))
+                + list(src.glob("*.csv"))
+                + list(src.glob("**/*.csv"))
+            )
+
             for f in found:
                 all_files.append((f, source_tag))
+
         elif src.is_file():
             all_files.append((src, source_tag))
 
     if not all_files:
-        raise FileNotFoundError(f"No .psv or .csv patient files found across sources: {data_sources}")
+        raise FileNotFoundError(
+            f"No .psv or .csv patient files found across sources: "
+            f"{data_sources}"
+        )
 
     if max_files:
         all_files = all_files[:max_files]
-        
+
     return all_files
 
 
 PHYSIONET_DTYPES = {
-    "HR": "float32", "O2Sat": "float32", "Temp": "float32", "SBP": "float32",
-    "MAP": "float32", "DBP": "float32", "Resp": "float32", "BaseExcess": "float32",
-    "HCO3": "float32", "FiO2": "float32", "pH": "float32", "PaCO2": "float32",
-    "SaO2": "float32", "AST": "float32", "BUN": "float32", "Alkalinephos": "float32",
-    "Calcium": "float32", "Chloride": "float32", "Creatinine": "float32",
-    "Bilirubin_direct": "float32", "Glucose": "float32", "Lactate": "float32",
-    "Magnesium": "float32", "Phosphate": "float32", "Potassium": "float32",
-    "Bilirubin_total": "float32", "TroponinI": "float32", "Hct": "float32",
-    "Hgb": "float32", "PTT": "float32", "WBC": "float32", "Fibrinogen": "float32",
-    "Platelets": "float32", "Age": "float32", "Gender": "float32", "Unit1": "float32",
-    "Unit2": "float32", "HospAdmTime": "float32", "ICULOS": "float32", "SepsisLabel": "int32"
+    "HR": "float32",
+    "O2Sat": "float32",
+    "Temp": "float32",
+    "SBP": "float32",
+    "MAP": "float32",
+    "DBP": "float32",
+    "Resp": "float32",
+    "BaseExcess": "float32",
+    "HCO3": "float32",
+    "FiO2": "float32",
+    "pH": "float32",
+    "PaCO2": "float32",
+    "SaO2": "float32",
+    "AST": "float32",
+    "BUN": "float32",
+    "Alkalinephos": "float32",
+    "Calcium": "float32",
+    "Chloride": "float32",
+    "Creatinine": "float32",
+    "Bilirubin_direct": "float32",
+    "Glucose": "float32",
+    "Lactate": "float32",
+    "Magnesium": "float32",
+    "Phosphate": "float32",
+    "Potassium": "float32",
+    "Bilirubin_total": "float32",
+    "TroponinI": "float32",
+    "Hct": "float32",
+    "Hgb": "float32",
+    "PTT": "float32",
+    "WBC": "float32",
+    "Fibrinogen": "float32",
+    "Platelets": "float32",
+    "Age": "float32",
+    "Gender": "float32",
+    "Unit1": "float32",
+    "Unit2": "float32",
+    "HospAdmTime": "float32",
+    "ICULOS": "float32",
+    "SepsisLabel": "int32",
 }
 
 
-def _read_single_file_fast(item: Tuple[Path, str]) -> Optional[pd.DataFrame]:
-    """Reads a single patient file at high speed with predefined types."""
+def _read_single_file_fast(
+    item: Tuple[Path, str]
+) -> Optional[pd.DataFrame]:
+
     fpath, src_tag = item
+
     sep = "|" if fpath.suffix.lower() == ".psv" else ","
+
     try:
-        p_df = pd.read_csv(fpath, sep=sep, engine="c", dtype=PHYSIONET_DTYPES, low_memory=False)
+
+        p_df = pd.read_csv(
+            fpath,
+            sep=sep,
+            engine="c",
+            dtype=PHYSIONET_DTYPES,
+            low_memory=False,
+        )
+
         p_df["patient_id"] = f"{src_tag}_{fpath.stem}"
         p_df["hospital_source"] = src_tag
+
         return p_df
+
     except Exception:
+
         try:
-            p_df = pd.read_csv(fpath, sep=sep, engine="c", low_memory=False)
+
+            p_df = pd.read_csv(
+                fpath,
+                sep=sep,
+                engine="c",
+                low_memory=False,
+            )
+
             p_df["patient_id"] = f"{src_tag}_{fpath.stem}"
             p_df["hospital_source"] = src_tag
+
             return p_df
+
         except Exception:
+
             return None
 
 
-def load_file_batch(file_batch: List[Tuple[Path, str]], max_workers: Optional[int] = None) -> pd.DataFrame:
-    """Reads a batch of patient files concurrently across multiple threads."""
-    workers = max_workers or min(32, (os.cpu_count() or 4) * 4)
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        results = list(executor.map(_read_single_file_fast, file_batch))
-    
-    valid_dfs = [df for df in results if df is not None and not df.empty]
+def load_file_batch(
+    file_batch: List[Tuple[Path, str]],
+    max_workers: Optional[int] = None
+) -> pd.DataFrame:
+
+    workers = (
+        max_workers
+        or min(32, (os.cpu_count() or 4) * 4)
+    )
+
+    with ThreadPoolExecutor(
+        max_workers=workers
+    ) as executor:
+
+        results = list(
+            executor.map(
+                _read_single_file_fast,
+                file_batch
+            )
+        )
+
+    valid_dfs = [
+        df
+        for df in results
+        if df is not None and not df.empty
+    ]
+
     if not valid_dfs:
         return pd.DataFrame()
-    return pd.concat(valid_dfs, ignore_index=True)
+
+    return pd.concat(
+        valid_dfs,
+        ignore_index=True
+    )
 
 
 def load_raw_dataset(
@@ -232,29 +431,63 @@ def load_raw_dataset(
     max_files: Optional[int] = None,
     max_workers: Optional[int] = None,
 ) -> pd.DataFrame:
-    """
-    High-speed parallel multi-dataset loader.
-    Spreads file I/O across multiple threads, accelerating read speed by 10-20x.
-    """
-    all_files = discover_patient_files(data_sources, max_files=max_files)
-    workers = max_workers or min(32, (os.cpu_count() or 4) * 4)
-    logger.info(f"⚡ Fast Parallel Ingestion: reading {len(all_files):,} records across {workers} I/O threads...")
-    
+
+    all_files = discover_patient_files(
+        data_sources,
+        max_files=max_files
+    )
+
+    workers = (
+        max_workers
+        or min(32, (os.cpu_count() or 4) * 4)
+    )
+
+    logger.info(
+        f"Fast Parallel Ingestion: reading "
+        f"{len(all_files):,} records across "
+        f"{workers} I/O threads..."
+    )
+
     from tqdm import tqdm
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        results = list(tqdm(
-            executor.map(_read_single_file_fast, all_files),
-            total=len(all_files),
-            desc="⚡ Ingesting Records (Parallel Multi-Thread)",
-            unit="pt"
-        ))
-        
-    valid_dfs = [df for df in results if df is not None and not df.empty]
+
+    with ThreadPoolExecutor(
+        max_workers=workers
+    ) as executor:
+
+        results = list(
+            tqdm(
+                executor.map(
+                    _read_single_file_fast,
+                    all_files
+                ),
+                total=len(all_files),
+                desc="Ingesting Records",
+                unit="pt",
+            )
+        )
+
+    valid_dfs = [
+        df
+        for df in results
+        if df is not None and not df.empty
+    ]
+
     if not valid_dfs:
-        raise ValueError("Could not successfully read any patient files.")
-        
-    combined_df = pd.concat(valid_dfs, ignore_index=True)
-    logger.info(f"Ingested {len(valid_dfs):,} patients ({len(combined_df):,} hourly records) in parallel.")
+        raise ValueError(
+            "Could not successfully read any patient files."
+        )
+
+    combined_df = pd.concat(
+        valid_dfs,
+        ignore_index=True
+    )
+
+    logger.info(
+        f"Ingested {len(valid_dfs):,} patients "
+        f"({len(combined_df):,} hourly records) "
+        f"in parallel."
+    )
+
     return combined_df
 
 
@@ -267,70 +500,168 @@ def load_or_extract_features_with_checkpoints(
     max_files: Optional[int] = None,
     force_recompute: bool = False,
 ) -> pd.DataFrame:
-    """
-    Two-Level Checkpoint & Resume Architecture:
-      Level 1: Checks for master cached parquet (data_processed/engineered_features.parquet).
-               If present and not force_recompute, loads instantly in 1-2 seconds.
-      Level 2: If extracting from raw files, processes in incremental chunks.
-               Each completed chunk is written to checkpoint_dir/chunk_XXXX.parquet.
-               If interrupted, resumes exactly from the last completed chunk without data loss.
-    """
-    # 1. Master Cache Level
-    if not force_recompute and processed_features_path.exists():
-        logger.info(f"⚡ [RESUME LEVEL 1] Found master feature cache: {processed_features_path}")
-        logger.info("Loading precomputed engineered features from disk (skipping raw ingestion)...")
-        feature_df = pd.read_parquet(processed_features_path)
-        logger.info(f"Loaded feature matrix: {feature_df.shape[0]:,} rows, {feature_df.shape[1]:,} columns.")
+
+    # Level 1: Master cache
+
+    if (
+        not force_recompute
+        and processed_features_path.exists()
+    ):
+
+        logger.info(
+            f"Found master feature cache: "
+            f"{processed_features_path}"
+        )
+
+        logger.info(
+            "Loading precomputed engineered features "
+            "from disk (skipping raw ingestion)..."
+        )
+
+        feature_df = pd.read_parquet(
+            processed_features_path
+        )
+
+        logger.info(
+            f"Loaded feature matrix: "
+            f"{feature_df.shape[0]:,} rows, "
+            f"{feature_df.shape[1]:,} columns."
+        )
+
         return feature_df
 
-    # 2. Incremental Chunk Checkpoints Level
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    all_files = discover_patient_files(data_sources, max_files=max_files)
-    n_files = len(all_files)
-    logger.info(f"Discovered {n_files} patient records. Processing in chunks of {chunk_size} with auto-checkpoints...")
+    # Level 2: Chunk checkpoints
 
-    chunks = [all_files[i:i + chunk_size] for i in range(0, n_files, chunk_size)]
+    checkpoint_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    all_files = discover_patient_files(
+        data_sources,
+        max_files=max_files
+    )
+
+    n_files = len(all_files)
+
+    logger.info(
+        f"Discovered {n_files} patient records. "
+        f"Processing in chunks of {chunk_size}..."
+    )
+
+    chunks = [
+        all_files[i:i + chunk_size]
+        for i in range(
+            0,
+            n_files,
+            chunk_size
+        )
+    ]
+
     chunk_feature_dfs = []
 
     from tqdm import tqdm
-    for idx, chunk in enumerate(tqdm(chunks, desc="Processing Patient Chunks", unit="chunk")):
-        chunk_file = checkpoint_dir / f"chunk_{idx:04d}.parquet"
-        
-        # Check if this intermediate chunk was already completed in a prior run
-        if not force_recompute and chunk_file.exists():
-            logger.info(f"⚡ [RESUME LEVEL 2] Checkpoint found for chunk {idx + 1}/{len(chunks)} ({chunk_file.name}). Loading...")
-            chunk_df = pd.read_parquet(chunk_file)
-            chunk_feature_dfs.append(chunk_df)
+
+    for idx, chunk in enumerate(
+        tqdm(
+            chunks,
+            desc="Processing Patient Chunks",
+            unit="chunk"
+        )
+    ):
+
+        chunk_file = (
+            checkpoint_dir
+            / f"chunk_{idx:04d}.parquet"
+        )
+
+        if (
+            not force_recompute
+            and chunk_file.exists()
+        ):
+
+            logger.info(
+                f"Loading checkpoint "
+                f"{idx + 1}/{len(chunks)}: "
+                f"{chunk_file.name}"
+            )
+
+            chunk_df = pd.read_parquet(
+                chunk_file
+            )
+
+            chunk_feature_dfs.append(
+                chunk_df
+            )
+
             continue
 
-        # Ingest and transform current batch
         batch_raw_df = load_file_batch(chunk)
+
         if batch_raw_df.empty:
             continue
 
-        chunk_features = extractor.transform(batch_raw_df)
-        
-        # Preserve hospital source if available
+        chunk_features = extractor.transform(
+            batch_raw_df
+        )
+
         if "hospital_source" in batch_raw_df.columns:
-            chunk_features["hospital_source"] = batch_raw_df["hospital_source"].values
 
-        # Save chunk checkpoint immediately
-        chunk_features.to_parquet(chunk_file, index=False, compression="snappy")
-        logger.info(f"💾 Checkpoint saved: {chunk_file.name} ({len(chunk_features)} rows)")
-        chunk_feature_dfs.append(chunk_features)
+            chunk_features[
+                "hospital_source"
+            ] = batch_raw_df[
+                "hospital_source"
+            ].values
 
-    # 3. Assemble and save Master Feature Cache
-    logger.info("Assembling all chunk checkpoints into master feature dataset...")
-    full_feature_df = pd.concat(chunk_feature_dfs, ignore_index=True)
-    processed_features_path.parent.mkdir(parents=True, exist_ok=True)
-    full_feature_df.to_parquet(processed_features_path, index=False, compression="snappy")
-    logger.info(f"💾 Master feature cache saved to: {processed_features_path.resolve()}")
+        chunk_features.to_parquet(
+            chunk_file,
+            index=False,
+            compression="snappy"
+        )
+
+        logger.info(
+            f"Checkpoint saved: "
+            f"{chunk_file.name} "
+            f"({len(chunk_features)} rows)"
+        )
+
+        chunk_feature_dfs.append(
+            chunk_features
+        )
+
+    logger.info(
+        "Assembling all chunk checkpoints "
+        "into master feature dataset..."
+    )
+
+    full_feature_df = pd.concat(
+        chunk_feature_dfs,
+        ignore_index=True
+    )
+
+    processed_features_path.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    full_feature_df.to_parquet(
+        processed_features_path,
+        index=False,
+        compression="snappy"
+    )
+
+    logger.info(
+        f"Master feature cache saved to: "
+        f"{processed_features_path.resolve()}"
+    )
+
     return full_feature_df
 
 
 # ==============================================================================
 # 3. Model Training Engine
 # ==============================================================================
+
 def train_and_evaluate_baselines(
     config_path: str = "configs/base.yaml",
     data_dir: Optional[Union[str, List[str]]] = None,
@@ -344,193 +675,660 @@ def train_and_evaluate_baselines(
     chunk_size: int = 500,
     force_recompute: bool = False,
 ) -> Dict[str, Dict[str, Union[float, str]]]:
-    """
-    Executes end-to-end baseline training and evaluation with multi-stage checkpointing:
-      - Resumes from data_processed/engineered_features.parquet if present.
-      - Resumes from incremental chunk checkpoints (data_processed/checkpoints/chunk_XXXX.parquet)
-        if raw extraction was interrupted.
-      - Performs patient-level group split or cross-hospital domain transfer split.
-      - Trains Logistic Regression (balanced) and XGBoost (scale_pos_weight).
-      - Computes AUROC, AUPRC, F1, Brier, and PhysioNet Utility.
-      - Generates publication-grade figures and markdown report.
-    """
+
     # Load configuration
+
     if Path(config_path).exists():
-        with open(config_path, "r", encoding="utf-8") as f:
+
+        with open(
+            config_path,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
             cfg = yaml.safe_load(f)
+
     else:
+
         cfg = {}
 
     seed = cfg.get("seed", 42)
+
     np.random.seed(seed)
 
     extractor = TemporalFeatureExtractor(
-        windows_hours=cfg.get("features", {}).get("windows_hours", [6, 12, 24]),
-        aggregations=cfg.get("features", {}).get("aggregations", ["mean", "min", "max", "std"]),
-        delta_hours=cfg.get("features", {}).get("delta_hours", [1, 3, 6]),
-        include_clinical_scores=cfg.get("features", {}).get("include_clinical_scores", True),
-        include_missingness=cfg.get("features", {}).get("include_missingness", True),
-        include_deltas=cfg.get("features", {}).get("include_deltas", True),
+        windows_hours=cfg.get(
+            "features", {}
+        ).get(
+            "windows_hours",
+            [6, 12, 24]
+        ),
+
+        aggregations=cfg.get(
+            "features", {}
+        ).get(
+            "aggregations",
+            ["mean", "min", "max", "std"]
+        ),
+
+        delta_hours=cfg.get(
+            "features", {}
+        ).get(
+            "delta_hours",
+            [1, 3, 6]
+        ),
+
+        include_clinical_scores=cfg.get(
+            "features", {}
+        ).get(
+            "include_clinical_scores",
+            True
+        ),
+
+        include_missingness=cfg.get(
+            "features", {}
+        ).get(
+            "include_missingness",
+            True
+        ),
+
+        include_deltas=cfg.get(
+            "features", {}
+        ).get(
+            "include_deltas",
+            True
+        ),
+
         patient_id_col="patient_id",
         time_col="ICULOS",
         target_col="SepsisLabel",
     )
 
-    # 1. Dataset Acquisition & Checkpointed Feature Extraction
+    # ==========================================================================
+    # Dataset acquisition
+    # ==========================================================================
+
     if use_synthetic or not data_dir:
-        logger.info("Initializing baseline training using synthesized high-fidelity ICU cohort...")
-        raw_df = generate_synthetic_icu_cohort(n_patients=n_synthetic_patients, seed=seed)
-        feature_matrix = extractor.transform(raw_df)
-    else:
-        logger.info(f"Targeting data source(s): {data_dir}")
-        feature_matrix = load_or_extract_features_with_checkpoints(
-            extractor=extractor,
-            data_sources=data_dir,
-            processed_features_path=Path(processed_features_path),
-            checkpoint_dir=Path(checkpoint_dir),
-            chunk_size=chunk_size,
-            max_files=max_files,
-            force_recompute=force_recompute,
+
+        logger.info(
+            "Initializing baseline training using "
+            "synthesized ICU cohort..."
         )
 
-    exclude_cols = {"patient_id", "ICULOS", "SepsisLabel", "hospital_source"}
-    feature_cols = [c for c in feature_matrix.columns if c not in exclude_cols]
+        raw_df = generate_synthetic_icu_cohort(
+            n_patients=n_synthetic_patients,
+            seed=seed
+        )
+
+        feature_matrix = extractor.transform(
+            raw_df
+        )
+
+    else:
+
+        logger.info(
+            f"Targeting data source(s): {data_dir}"
+        )
+
+        feature_matrix = (
+            load_or_extract_features_with_checkpoints(
+                extractor=extractor,
+                data_sources=data_dir,
+                processed_features_path=Path(
+                    processed_features_path
+                ),
+                checkpoint_dir=Path(
+                    checkpoint_dir
+                ),
+                chunk_size=chunk_size,
+                max_files=max_files,
+                force_recompute=force_recompute,
+            )
+        )
+
+    # ==========================================================================
+    # Feature preparation
+    # ==========================================================================
+
+    exclude_cols = {
+        "patient_id",
+        "ICULOS",
+        "SepsisLabel",
+        "hospital_source",
+    }
+
+    feature_cols = [
+        c
+        for c in feature_matrix.columns
+        if c not in exclude_cols
+    ]
+
     target_col = "SepsisLabel"
     patient_id_col = "patient_id"
 
-    # Enforce float32 downcasting across all feature columns to prevent memory blowups
-    float_cols = feature_matrix[feature_cols].select_dtypes(include=["float64"]).columns
+    float_cols = (
+        feature_matrix[feature_cols]
+        .select_dtypes(
+            include=["float64"]
+        )
+        .columns
+    )
+
     if len(float_cols) > 0:
-        logger.info(f"⚡ Downcasting {len(float_cols)} float64 columns to float32 for RAM safety...")
-        feature_matrix[float_cols] = feature_matrix[float_cols].astype(np.float32)
+
+        logger.info(
+            f"Downcasting {len(float_cols)} "
+            f"float64 columns to float32..."
+        )
+
+        feature_matrix[
+            float_cols
+        ] = feature_matrix[
+            float_cols
+        ].astype(
+            np.float32
+        )
+
     gc.collect()
 
-    y = feature_matrix[target_col].values.astype(np.int32)
-    patient_ids = feature_matrix[patient_id_col].values
+    y = feature_matrix[
+        target_col
+    ].values.astype(
+        np.int32
+    )
 
-    # 3. Memory-Safe Patient Partitioning (Zero-Copy)
-    logger.info("⚡ Partitioning cohort by unique patient IDs without duplicating memory...")
-    hospitals = feature_matrix.get("hospital_source", None)
-    if cross_hospital_split and hospitals is not None and len(hospitals.unique()) >= 2:
-        unique_hosp = sorted(hospitals.unique())
-        train_hosp = unique_hosp[0]
-        test_hosp = unique_hosp[1]
-        logger.info(f"Cross-Hospital Domain Transfer: Training on '{train_hosp}', Testing on '{test_hosp}'")
-        train_val_mask = (hospitals == train_hosp).values
-        test_mask = (hospitals == test_hosp).values
-        
-        # Split train into train & val
-        train_val_pids = np.unique(patient_ids[train_val_mask])
-        np.random.seed(seed)
-        np.random.shuffle(train_val_pids)
-        split_pt = int(len(train_val_pids) * 0.85)
-        train_pids = set(train_val_pids[:split_pt])
-        val_pids = set(train_val_pids[split_pt:])
-        
-        train_mask = train_val_mask & pd.Series(patient_ids).isin(train_pids).values
-        val_mask = train_val_mask & pd.Series(patient_ids).isin(val_pids).values
-    else:
-        unique_pids = np.unique(patient_ids)
-        np.random.seed(seed)
-        np.random.shuffle(unique_pids)
+    patient_ids = feature_matrix[
+        patient_id_col
+    ].values
 
-        n_total_pts = len(unique_pids)
-        n_train_pts = int(n_total_pts * 0.70)
-        n_val_pts = int(n_total_pts * 0.15)
-
-        train_pids = set(unique_pids[:n_train_pts])
-        val_pids = set(unique_pids[n_train_pts:n_train_pts + n_val_pts])
-        test_pids = set(unique_pids[n_train_pts + n_val_pts:])
-
-        pid_series = pd.Series(patient_ids)
-        train_mask = pid_series.isin(train_pids).values
-        val_mask = pid_series.isin(val_pids).values
-        test_mask = pid_series.isin(test_pids).values
-
-    y_train = y[train_mask]
-    y_val = y[val_mask]
-    y_test = y[test_mask]
+    # ==========================================================================
+    # Patient-level partitioning
+    # ==========================================================================
 
     logger.info(
-        f"Data Partitioning: Train={np.sum(train_mask):,} rows | "
+        "Partitioning cohort by unique patient IDs..."
+    )
+
+    hospitals = feature_matrix.get(
+        "hospital_source",
+        None
+    )
+
+    if (
+        cross_hospital_split
+        and hospitals is not None
+        and len(hospitals.unique()) >= 2
+    ):
+
+        unique_hosp = sorted(
+            hospitals.unique()
+        )
+
+        train_hosp = unique_hosp[0]
+        test_hosp = unique_hosp[1]
+
+        logger.info(
+            f"Cross-Hospital Domain Transfer: "
+            f"Training on '{train_hosp}', "
+            f"Testing on '{test_hosp}'"
+        )
+
+        train_val_mask = (
+            hospitals == train_hosp
+        ).values
+
+        test_mask = (
+            hospitals == test_hosp
+        ).values
+
+        train_val_pids = np.unique(
+            patient_ids[
+                train_val_mask
+            ]
+        )
+
+        np.random.seed(seed)
+
+        np.random.shuffle(
+            train_val_pids
+        )
+
+        split_pt = int(
+            len(train_val_pids) * 0.85
+        )
+
+        train_pids = set(
+            train_val_pids[:split_pt]
+        )
+
+        val_pids = set(
+            train_val_pids[split_pt:]
+        )
+
+        train_mask = (
+            train_val_mask
+            & pd.Series(
+                patient_ids
+            ).isin(
+                train_pids
+            ).values
+        )
+
+        val_mask = (
+            train_val_mask
+            & pd.Series(
+                patient_ids
+            ).isin(
+                val_pids
+            ).values
+        )
+
+    else:
+
+        unique_pids = np.unique(
+            patient_ids
+        )
+
+        np.random.seed(seed)
+
+        np.random.shuffle(
+            unique_pids
+        )
+
+        n_total_pts = len(
+            unique_pids
+        )
+
+        n_train_pts = int(
+            n_total_pts * 0.70
+        )
+
+        n_val_pts = int(
+            n_total_pts * 0.15
+        )
+
+        train_pids = set(
+            unique_pids[
+                :n_train_pts
+            ]
+        )
+
+        val_pids = set(
+            unique_pids[
+                n_train_pts:
+                n_train_pts + n_val_pts
+            ]
+        )
+
+        test_pids = set(
+            unique_pids[
+                n_train_pts + n_val_pts:
+            ]
+        )
+
+        pid_series = pd.Series(
+            patient_ids
+        )
+
+        train_mask = (
+            pid_series
+            .isin(train_pids)
+            .values
+        )
+
+        val_mask = (
+            pid_series
+            .isin(val_pids)
+            .values
+        )
+
+        test_mask = (
+            pid_series
+            .isin(test_pids)
+            .values
+        )
+
+    y_train = y[
+        train_mask
+    ]
+
+    y_val = y[
+        val_mask
+    ]
+
+    y_test = y[
+        test_mask
+    ]
+
+    logger.info(
+        f"Data Partitioning: "
+        f"Train={np.sum(train_mask):,} rows | "
         f"Val={np.sum(val_mask):,} rows | "
         f"Test={np.sum(test_mask):,} rows"
     )
 
-    # Class imbalance scale factor
-    n_neg = int(np.sum(y_train == 0))
-    n_pos = int(np.sum(y_train == 1))
-    scale_pos = max(1.0, float(n_neg) / max(1.0, float(n_pos)))
-    logger.info(f"Class Distribution: {n_pos:,} Positive vs {n_neg:,} Negative (scale_pos_weight = {scale_pos:.2f})")
-
-    results_dict: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
-    metrics_summary: List[Dict[str, Union[float, str]]] = []
-
     # ==========================================================================
-    # Model 1: XGBoost Classifier (Histogram-based, Native Missing Value Support)
+    # Class imbalance
     # ==========================================================================
-    # We train XGBoost first directly on slices; hist tree uses minimal RAM and supports NaNs natively!
-    logger.info("Training Model 1: XGBoost Gradient Boosting Classifier (Histogram Engine)...")
-    xgb_params = cfg.get("models", {}).get("xgboost", {})
-    xgb_model = xgb.XGBClassifier(
-        n_estimators=xgb_params.get("n_estimators", 50),
-        learning_rate=xgb_params.get("learning_rate", 0.05),
-        max_depth=xgb_params.get("max_depth", 5),
-        subsample=xgb_params.get("subsample", 0.8),
-        colsample_bytree=xgb_params.get("colsample_bytree", 0.8),
-        scale_pos_weight=scale_pos,
-        tree_method="hist",
-        eval_metric="aucpr",
-        early_stopping_rounds=xgb_params.get("early_stopping_rounds", 30),
-        random_state=seed,
-        n_jobs=2,
+
+    n_neg = int(
+        np.sum(
+            y_train == 0
+        )
     )
 
-    X_train_xgb = feature_matrix.loc[train_mask, feature_cols]
-    X_val_xgb = feature_matrix.loc[val_mask, feature_cols]
-    X_test_xgb = feature_matrix.loc[test_mask, feature_cols]
+    n_pos = int(
+        np.sum(
+            y_train == 1
+        )
+    )
+
+    scale_pos = max(
+        1.0,
+        float(n_neg)
+        / max(
+            1.0,
+            float(n_pos)
+        )
+    )
+
+    logger.info(
+        f"Class Distribution: "
+        f"{n_pos:,} Positive vs "
+        f"{n_neg:,} Negative "
+        f"(scale_pos_weight = {scale_pos:.2f})"
+    )
+
+    results_dict = {}
+    metrics_summary = []
+
+    # ==========================================================================
+    # Model 1: XGBoost
+    # ==========================================================================
+
+    logger.info(
+        "Training Model 1: XGBoost Gradient Boosting Classifier..."
+    )
+
+    xgb_params = cfg.get(
+        "models",
+        {}
+    ).get(
+        "xgboost",
+        {}
+    )
+
+    xgb_model = xgb.XGBClassifier(
+
+        n_estimators=xgb_params.get(
+            "n_estimators",
+            100
+        ),
+
+        learning_rate=xgb_params.get(
+            "learning_rate",
+            0.05
+        ),
+
+        max_depth=xgb_params.get(
+            "max_depth",
+            5
+        ),
+
+        subsample=xgb_params.get(
+            "subsample",
+            0.8
+        ),
+
+        colsample_bytree=xgb_params.get(
+            "colsample_bytree",
+            0.8
+        ),
+
+        scale_pos_weight=scale_pos,
+
+        tree_method="hist",
+
+        eval_metric="aucpr",
+
+        early_stopping_rounds=xgb_params.get(
+            "early_stopping_rounds",
+            30
+        ),
+
+        random_state=seed,
+
+        n_jobs=4,
+    )
+
+    # --------------------------------------------------------------------------
+    # Create train / validation / test feature matrices
+    # --------------------------------------------------------------------------
+
+    X_train_xgb = feature_matrix.loc[
+        train_mask,
+        feature_cols
+    ]
+
+    X_val_xgb = feature_matrix.loc[
+        val_mask,
+        feature_cols
+    ]
+
+    X_test_xgb = feature_matrix.loc[
+        test_mask,
+        feature_cols
+    ]
+
+    # --------------------------------------------------------------------------
+    # MEMORY GUARD FOR XGBOOST
+    # --------------------------------------------------------------------------
+
+    max_xgb_train_rows = 200000
+
+    if len(y_train) > max_xgb_train_rows:
+
+        logger.info(
+            f"Memory Guard: Subsampling "
+            f"{max_xgb_train_rows:,} rows "
+            f"from {len(y_train):,} "
+            f"training rows for XGBoost..."
+        )
+
+        rng = np.random.default_rng(
+            seed
+        )
+
+        xgb_indices = rng.choice(
+            len(y_train),
+            size=max_xgb_train_rows,
+            replace=False
+        )
+
+        X_train_xgb = (
+            X_train_xgb.iloc[
+                xgb_indices
+            ]
+        )
+
+        y_train_xgb = (
+            y_train[
+                xgb_indices
+            ]
+        )
+
+    else:
+
+        y_train_xgb = y_train
+
+    logger.info(
+        f"XGBoost training rows: "
+        f"{len(y_train_xgb):,}"
+    )
+
+    logger.info(
+        f"XGBoost validation rows: "
+        f"{len(y_val):,}"
+    )
+
+    # --------------------------------------------------------------------------
+    # Train XGBoost
+    # --------------------------------------------------------------------------
 
     xgb_model.fit(
-        X_train_xgb, y_train,
-        eval_set=[(X_val_xgb, y_val)],
+        X_train_xgb,
+        y_train_xgb,
+        eval_set=[
+            (
+                X_val_xgb,
+                y_val
+            )
+        ],
         verbose=False,
     )
-    xgb_probs = xgb_model.predict_proba(X_test_xgb)[:, 1]
-    results_dict["XGBoost"] = (y_test, xgb_probs)
-    xgb_metrics = compute_clinical_metrics(y_test, xgb_probs, model_name="XGBoost")
-    metrics_summary.append(xgb_metrics)
-    logger.info(f"XGBoost Classifier — AUROC: {xgb_metrics['AUROC']:.3f} | AUPRC: {xgb_metrics['AUPRC']:.3f} | F1: {xgb_metrics['F1_Score']:.3f}")
+
+    xgb_probs = (
+        xgb_model
+        .predict_proba(
+            X_test_xgb
+        )[:, 1]
+    )
+
+    results_dict[
+        "XGBoost"
+    ] = (
+        y_test,
+        xgb_probs
+    )
+
+    xgb_metrics = (
+        compute_clinical_metrics(
+            y_test,
+            xgb_probs,
+            model_name="XGBoost"
+        )
+    )
+
+    metrics_summary.append(
+        xgb_metrics
+    )
+
+    logger.info(
+        f"XGBoost Classifier — "
+        f"AUROC: {xgb_metrics['AUROC']:.3f} | "
+        f"AUPRC: {xgb_metrics['AUPRC']:.3f} | "
+        f"F1: {xgb_metrics['F1_Score']:.3f}"
+    )
+
+    # Free XGBoost feature matrices
 
     del X_val_xgb
+    del X_test_xgb
+    del X_train_xgb
+    del y_train_xgb
+
     gc.collect()
 
     # ==========================================================================
-    # Model 2: Logistic Regression (L2 Regularized with Memory-Safe Subsampling)
+    # Model 2: Logistic Regression
     # ==========================================================================
-    logger.info("Training Model 2: Regularized Logistic Regression...")
-    # On large cohorts (>200k rows), fit Logistic Regression on a representative stratified subsample
-    # to avoid 16GB+ memory allocation during dense StandardScaler / Hessian calculation
+
+    logger.info(
+        "Training Model 2: Regularized Logistic Regression..."
+    )
+
     max_lr_train_rows = 150000
+
+    # Recreate train/test feature matrices
+
+    X_train_lr_source = feature_matrix.loc[
+        train_mask,
+        feature_cols
+    ]
+
+    X_test_lr_source = feature_matrix.loc[
+        test_mask,
+        feature_cols
+    ]
+
     if len(y_train) > max_lr_train_rows:
-        logger.info(f"⚡ Memory Guard: Subsampling {max_lr_train_rows:,} rows from training set for Logistic Regression...")
-        rng = np.random.default_rng(seed)
-        sub_indices = rng.choice(len(y_train), size=max_lr_train_rows, replace=False)
-        X_train_lr = X_train_xgb.iloc[sub_indices]
-        y_train_lr = y_train[sub_indices]
+
+        logger.info(
+            f"Memory Guard: Subsampling "
+            f"{max_lr_train_rows:,} rows "
+            f"from training set for "
+            f"Logistic Regression..."
+        )
+
+        rng = np.random.default_rng(
+            seed
+        )
+
+        sub_indices = rng.choice(
+            len(y_train),
+            size=max_lr_train_rows,
+            replace=False
+        )
+
+        X_train_lr = (
+            X_train_lr_source.iloc[
+                sub_indices
+            ]
+        )
+
+        y_train_lr = (
+            y_train[
+                sub_indices
+            ]
+        )
+
     else:
-        X_train_lr = X_train_xgb
+
+        X_train_lr = X_train_lr_source
         y_train_lr = y_train
 
-    # In-place median imputation for linear model (computes medians on train slice)
-    col_medians = X_train_lr.median().astype(np.float32)
-    X_train_lr_imp = X_train_lr.fillna(col_medians).values.astype(np.float32)
-    X_test_lr_imp = X_test_xgb.fillna(col_medians).values.astype(np.float32)
+    # Median imputation
+
+    col_medians = (
+        X_train_lr
+        .median()
+        .astype(np.float32)
+    )
+
+    X_train_lr_imp = (
+        X_train_lr
+        .fillna(col_medians)
+        .values
+        .astype(np.float32)
+    )
+
+    X_test_lr_imp = (
+        X_test_lr_source
+        .fillna(col_medians)
+        .values
+        .astype(np.float32)
+    )
 
     scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train_lr_imp)
-    X_test_scaled = scaler.transform(X_test_lr_imp)
 
-    del X_train_lr, X_train_lr_imp, X_test_lr_imp, X_train_xgb
+    X_train_scaled = (
+        scaler.fit_transform(
+            X_train_lr_imp
+        )
+    )
+
+    X_test_scaled = (
+        scaler.transform(
+            X_test_lr_imp
+        )
+    )
+
+    del X_train_lr
+    del X_train_lr_imp
+    del X_test_lr_source
+    del X_test_lr_imp
+    del X_train_lr_source
+
     gc.collect()
 
     lr_model = LogisticRegression(
@@ -541,104 +1339,331 @@ def train_and_evaluate_baselines(
         class_weight="balanced",
         random_state=seed,
     )
-    lr_model.fit(X_train_scaled, y_train_lr)
-    lr_probs = lr_model.predict_proba(X_test_scaled)[:, 1]
 
-    results_dict["Logistic Regression"] = (y_test, lr_probs)
-    lr_metrics = compute_clinical_metrics(y_test, lr_probs, model_name="Logistic Regression")
-    metrics_summary.append(lr_metrics)
-    logger.info(f"Logistic Regression — AUROC: {lr_metrics['AUROC']:.3f} | AUPRC: {lr_metrics['AUPRC']:.3f} | F1: {lr_metrics['F1_Score']:.3f}")
+    lr_model.fit(
+        X_train_scaled,
+        y_train_lr
+    )
 
-    del X_train_scaled, X_test_scaled
+    lr_probs = (
+        lr_model
+        .predict_proba(
+            X_test_scaled
+        )[:, 1]
+    )
+
+    results_dict[
+        "Logistic Regression"
+    ] = (
+        y_test,
+        lr_probs
+    )
+
+    lr_metrics = (
+        compute_clinical_metrics(
+            y_test,
+            lr_probs,
+            model_name="Logistic Regression"
+        )
+    )
+
+    metrics_summary.append(
+        lr_metrics
+    )
+
+    logger.info(
+        f"Logistic Regression — "
+        f"AUROC: {lr_metrics['AUROC']:.3f} | "
+        f"AUPRC: {lr_metrics['AUPRC']:.3f} | "
+        f"F1: {lr_metrics['F1_Score']:.3f}"
+    )
+
+    del X_train_scaled
+    del X_test_scaled
+
     gc.collect()
-    logger.info(f"XGBoost Classifier — AUROC: {xgb_metrics['AUROC']:.3f} | AUPRC: {xgb_metrics['AUPRC']:.3f} | F1: {xgb_metrics['F1_Score']:.3f}")
 
     # ==========================================================================
-    # 5. Export Reports and Publication Figures
+    # 5. Export Reports
     # ==========================================================================
-    out_path = Path(output_dir)
-    figures_path = out_path / "figures"
-    figures_path.mkdir(parents=True, exist_ok=True)
 
-    # 1. Save Metrics JSON & Markdown Report
-    save_metrics_report(metrics_summary, output_dir=out_path)
+    out_path = Path(
+        output_dir
+    )
 
-    # 2. Publication Figures (300 DPI)
-    dpi = cfg.get("evaluation", {}).get("dpi", 300)
-    plot_roc_curves(results_dict, save_path=figures_path / "roc_curves.png", dpi=dpi)
-    plot_precision_recall_curves(results_dict, save_path=figures_path / "precision_recall_curves.png", dpi=dpi)
-    plot_calibration_curves(results_dict, save_path=figures_path / "calibration_curves.png", dpi=dpi)
-    plot_confusion_matrices(results_dict, save_path=figures_path / "confusion_matrices.png", dpi=dpi)
-    
-    # Feature Importance Plot
+    figures_path = (
+        out_path
+        / "figures"
+    )
+
+    figures_path.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    # Metrics report
+
+    save_metrics_report(
+        metrics_summary,
+        output_dir=out_path
+    )
+
+    # Figures
+
+    dpi = cfg.get(
+        "evaluation",
+        {}
+    ).get(
+        "dpi",
+        300
+    )
+
+    plot_roc_curves(
+        results_dict,
+        save_path=(
+            figures_path
+            / "roc_curves.png"
+        ),
+        dpi=dpi
+    )
+
+    plot_precision_recall_curves(
+        results_dict,
+        save_path=(
+            figures_path
+            / "precision_recall_curves.png"
+        ),
+        dpi=dpi
+    )
+
+    plot_calibration_curves(
+        results_dict,
+        save_path=(
+            figures_path
+            / "calibration_curves.png"
+        ),
+        dpi=dpi
+    )
+
+    plot_confusion_matrices(
+        results_dict,
+        save_path=(
+            figures_path
+            / "confusion_matrices.png"
+        ),
+        dpi=dpi
+    )
+
     plot_feature_importances(
         feature_names=feature_cols,
         importances=xgb_model.feature_importances_,
         top_n=25,
-        title="Top 25 Physiological Trajectory Predictors (XGBoost)",
-        save_path=figures_path / "feature_importance.png",
-        dpi=dpi,
+        title=(
+            "Top 25 Physiological "
+            "Trajectory Predictors (XGBoost)"
+        ),
+        save_path=(
+            figures_path
+            / "feature_importance.png"
+        ),
+        dpi=dpi
     )
 
-    # 3. Save Trained Model Weights
-    models_dir = Path("models")
-    models_dir.mkdir(parents=True, exist_ok=True)
-    joblib.dump(lr_model, models_dir / "logistic_regression_baseline.joblib")
-    joblib.dump(xgb_model, models_dir / "xgboost_baseline.joblib")
-    joblib.dump(col_medians, models_dir / "feature_medians.joblib")
-    joblib.dump(scaler, models_dir / "feature_scaler.joblib")
-    logger.info(f"Saved model checkpoints and scalers to: {models_dir.resolve()}")
+    # ==========================================================================
+    # Save models
+    # ==========================================================================
 
-    logger.info("=== Baseline Training and Evaluation Pipeline Finished Successfully ===")
-    return {m["model_name"]: m for m in metrics_summary}
+    models_dir = Path(
+        "models"
+    )
 
+    models_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    joblib.dump(
+        lr_model,
+        models_dir
+        / "logistic_regression_baseline.joblib"
+    )
+
+    joblib.dump(
+        xgb_model,
+        models_dir
+        / "xgboost_baseline.joblib"
+    )
+
+    joblib.dump(
+        col_medians,
+        models_dir
+        / "feature_medians.joblib"
+    )
+
+    joblib.dump(
+        scaler,
+        models_dir
+        / "feature_scaler.joblib"
+    )
+
+    logger.info(
+        f"Saved model checkpoints and scalers to: "
+        f"{models_dir.resolve()}"
+    )
+
+    logger.info(
+        "=== Baseline Training and Evaluation "
+        "Pipeline Finished Successfully ==="
+    )
+
+    return {
+        m["model_name"]: m
+        for m in metrics_summary
+    }
+
+
+# ==============================================================================
+# Main
+# ==============================================================================
 
 if __name__ == "__main__":
+
     parser = argparse.ArgumentParser(
-        description="CareTrajectory Baseline Training & Benchmark Runner",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=(
+            "CareTrajectory Baseline Training "
+            "& Benchmark Runner"
+        ),
+        formatter_class=(
+            argparse.ArgumentDefaultsHelpFormatter
+        ),
     )
-    parser.add_argument("--config", type=str, default="configs/base.yaml", help="Path to YAML configuration")
+
     parser.add_argument(
-        "--data_dir", nargs="+", default=None,
-        help="One or more directories containing raw patient PSV or CSV files (e.g., data/setA data/setB)"
+        "--config",
+        type=str,
+        default="configs/base.yaml",
+        help="Path to YAML configuration"
     )
-    parser.add_argument("--output_dir", type=str, default="reports", help="Output directory for reports & figures")
-    parser.add_argument("--use_synthetic", action="store_true", help="Force execution on synthetic ICU cohort")
-    parser.add_argument("--n_patients", type=int, default=150, help="Number of synthetic patients if synthesizing")
-    parser.add_argument("--max_files", type=int, default=None, help="Optional maximum number of patient files to load for quick trial")
+
     parser.add_argument(
-        "--cross_hospital", action="store_true",
-        help="Enable cross-hospital domain transfer evaluation (train on hospital A, test on hospital B)"
+        "--data_dir",
+        nargs="+",
+        default=None,
+        help=(
+            "One or more directories containing "
+            "raw patient PSV or CSV files"
+        )
     )
+
     parser.add_argument(
-        "--checkpoint_dir", type=str, default="data_processed/checkpoints",
-        help="Directory to store intermediate batch checkpoints for seamless resumption"
+        "--output_dir",
+        type=str,
+        default="reports",
+        help="Output directory for reports & figures"
     )
+
     parser.add_argument(
-        "--processed_features", type=str, default="data_processed/engineered_features.parquet",
-        help="Path to master precomputed parquet feature table"
+        "--use_synthetic",
+        action="store_true",
+        help="Force execution on synthetic ICU cohort"
     )
+
     parser.add_argument(
-        "--chunk_size", type=int, default=500,
-        help="Number of patient files to process per checkpoint chunk"
+        "--n_patients",
+        type=int,
+        default=150,
+        help=(
+            "Number of synthetic patients "
+            "if synthesizing"
+        )
     )
+
     parser.add_argument(
-        "--force_recompute", action="store_true",
-        help="Ignore existing checkpoints and force full re-computation from scratch"
+        "--max_files",
+        type=int,
+        default=None,
+        help=(
+            "Optional maximum number of patient "
+            "files to load for quick trial"
+        )
     )
-    
+
+    parser.add_argument(
+        "--cross_hospital",
+        action="store_true",
+        help=(
+            "Enable cross-hospital domain transfer "
+            "evaluation"
+        )
+    )
+
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default="data_processed/checkpoints",
+        help=(
+            "Directory to store intermediate "
+            "batch checkpoints"
+        )
+    )
+
+    parser.add_argument(
+        "--processed_features",
+        type=str,
+        default=(
+            "data_processed/"
+            "engineered_features.parquet"
+        ),
+        help=(
+            "Path to master precomputed "
+            "parquet feature table"
+        )
+    )
+
+    parser.add_argument(
+        "--chunk_size",
+        type=int,
+        default=500,
+        help=(
+            "Number of patient files to process "
+            "per checkpoint chunk"
+        )
+    )
+
+    parser.add_argument(
+        "--force_recompute",
+        action="store_true",
+        help=(
+            "Ignore existing checkpoints and "
+            "force full re-computation"
+        )
+    )
+
     args = parser.parse_args()
+
     train_and_evaluate_baselines(
+
         config_path=args.config,
+
         data_dir=args.data_dir,
+
         output_dir=args.output_dir,
+
         use_synthetic=args.use_synthetic,
+
         n_synthetic_patients=args.n_patients,
+
         max_files=args.max_files,
+
         cross_hospital_split=args.cross_hospital,
+
         checkpoint_dir=args.checkpoint_dir,
-        processed_features_path=args.processed_features,
+
+        processed_features_path=(
+            args.processed_features
+        ),
+
         chunk_size=args.chunk_size,
+
         force_recompute=args.force_recompute,
     )
