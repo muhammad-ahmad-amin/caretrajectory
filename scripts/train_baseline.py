@@ -11,6 +11,7 @@ evaluation artifacts and visual reports.
 """
 
 import argparse
+import gc
 import glob
 import logging
 import os
@@ -397,101 +398,79 @@ def train_and_evaluate_baselines(
     target_col = "SepsisLabel"
     patient_id_col = "patient_id"
 
-    X = feature_matrix[feature_cols].copy()
-    y = feature_matrix[target_col].values.astype(int)
-    groups = feature_matrix[patient_id_col].values
+    # Enforce float32 downcasting across all feature columns to prevent memory blowups
+    float_cols = feature_matrix[feature_cols].select_dtypes(include=["float64"]).columns
+    if len(float_cols) > 0:
+        logger.info(f"⚡ Downcasting {len(float_cols)} float64 columns to float32 for RAM safety...")
+        feature_matrix[float_cols] = feature_matrix[float_cols].astype(np.float32)
+    gc.collect()
 
-    # 3. Train/Validation/Test Partitioning
+    y = feature_matrix[target_col].values.astype(np.int32)
+    patient_ids = feature_matrix[patient_id_col].values
+
+    # 3. Memory-Safe Patient Partitioning (Zero-Copy)
+    logger.info("⚡ Partitioning cohort by unique patient IDs without duplicating memory...")
     hospitals = feature_matrix.get("hospital_source", None)
     if cross_hospital_split and hospitals is not None and len(hospitals.unique()) >= 2:
         unique_hosp = sorted(hospitals.unique())
         train_hosp = unique_hosp[0]
         test_hosp = unique_hosp[1]
         logger.info(f"Cross-Hospital Domain Transfer: Training on '{train_hosp}', Testing on '{test_hosp}'")
-        
         train_val_mask = (hospitals == train_hosp).values
         test_mask = (hospitals == test_hosp).values
         
-        X_train_val = X.iloc[train_val_mask]
-        y_train_val = y[train_val_mask]
-        groups_train_val = groups[train_val_mask]
+        # Split train into train & val
+        train_val_pids = np.unique(patient_ids[train_val_mask])
+        np.random.seed(seed)
+        np.random.shuffle(train_val_pids)
+        split_pt = int(len(train_val_pids) * 0.85)
+        train_pids = set(train_val_pids[:split_pt])
+        val_pids = set(train_val_pids[split_pt:])
         
-        X_test = X.iloc[test_mask]
-        y_test = y[test_mask]
-        groups_test = groups[test_mask]
+        train_mask = train_val_mask & pd.Series(patient_ids).isin(train_pids).values
+        val_mask = train_val_mask & pd.Series(patient_ids).isin(val_pids).values
     else:
-        logger.info(f"Executing patient-level GroupShuffleSplit on '{patient_id_col}'...")
-        gss_test = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=seed)
-        train_val_idx, test_idx = next(gss_test.split(X, y, groups=groups))
+        unique_pids = np.unique(patient_ids)
+        np.random.seed(seed)
+        np.random.shuffle(unique_pids)
 
-        X_train_val = X.iloc[train_val_idx]
-        y_train_val = y[train_val_idx]
-        groups_train_val = groups[train_val_idx]
+        n_total_pts = len(unique_pids)
+        n_train_pts = int(n_total_pts * 0.70)
+        n_val_pts = int(n_total_pts * 0.15)
 
-        X_test = X.iloc[test_idx]
-        y_test = y[test_idx]
-        groups_test = groups[test_idx]
+        train_pids = set(unique_pids[:n_train_pts])
+        val_pids = set(unique_pids[n_train_pts:n_train_pts + n_val_pts])
+        test_pids = set(unique_pids[n_train_pts + n_val_pts:])
 
-    # Split train and validation for early stopping
-    gss_val = GroupShuffleSplit(n_splits=1, test_size=0.15, random_state=seed)
-    train_idx, val_idx = next(gss_val.split(X_train_val, y_train_val, groups=groups_train_val))
+        pid_series = pd.Series(patient_ids)
+        train_mask = pid_series.isin(train_pids).values
+        val_mask = pid_series.isin(val_pids).values
+        test_mask = pid_series.isin(test_pids).values
 
-    X_train = X_train_val.iloc[train_idx]
-    y_train = y_train_val[train_idx]
-
-    X_val = X_train_val.iloc[val_idx]
-    y_val = y_train_val[val_idx]
+    y_train = y[train_mask]
+    y_val = y[val_mask]
+    y_test = y[test_mask]
 
     logger.info(
-        f"Data Partitioning: Train={len(X_train)} rows ({len(np.unique(groups[train_val_idx][train_idx]))} pts) | "
-        f"Val={len(X_val)} rows ({len(np.unique(groups[train_val_idx][val_idx]))} pts) | "
-        f"Test={len(X_test)} rows ({len(np.unique(groups_test))} pts)"
+        f"Data Partitioning: Train={np.sum(train_mask):,} rows | "
+        f"Val={np.sum(val_mask):,} rows | "
+        f"Test={np.sum(test_mask):,} rows"
     )
-
-    # 4. Handle Missing Values
-    # Median imputation fitted solely on training partition to prevent distribution leakage
-    imputer = SimpleImputer(strategy="median")
-    X_train_imp = imputer.fit_transform(X_train)
-    X_val_imp = imputer.transform(X_val)
-    X_test_imp = imputer.transform(X_test)
 
     # Class imbalance scale factor
     n_neg = int(np.sum(y_train == 0))
     n_pos = int(np.sum(y_train == 1))
     scale_pos = max(1.0, float(n_neg) / max(1.0, float(n_pos)))
-    logger.info(f"Class Distribution: {n_pos} Positive vs {n_neg} Negative (scale_pos_weight = {scale_pos:.2f})")
+    logger.info(f"Class Distribution: {n_pos:,} Positive vs {n_neg:,} Negative (scale_pos_weight = {scale_pos:.2f})")
 
     results_dict: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
     metrics_summary: List[Dict[str, Union[float, str]]] = []
 
     # ==========================================================================
-    # Model 1: Logistic Regression (L2 Regularized with Balanced Class Weight)
+    # Model 1: XGBoost Classifier (Histogram-based, Native Missing Value Support)
     # ==========================================================================
-    logger.info("Training Baseline 1: Regularized Logistic Regression...")
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train_imp)
-    X_test_scaled = scaler.transform(X_test_imp)
-
-    lr_model = LogisticRegression(
-        penalty="l2",
-        C=0.1,
-        solver="lbfgs",
-        max_iter=1000,
-        class_weight="balanced",
-        random_state=seed,
-    )
-    lr_model.fit(X_train_scaled, y_train)
-    lr_probs = lr_model.predict_proba(X_test_scaled)[:, 1]
-    
-    results_dict["Logistic Regression"] = (y_test, lr_probs)
-    lr_metrics = compute_clinical_metrics(y_test, lr_probs, model_name="Logistic Regression")
-    metrics_summary.append(lr_metrics)
-    logger.info(f"Logistic Regression — AUROC: {lr_metrics['AUROC']:.3f} | AUPRC: {lr_metrics['AUPRC']:.3f} | F1: {lr_metrics['F1_Score']:.3f}")
-
-    # ==========================================================================
-    # Model 2: XGBoost Classifier (Histogram-based, Fast Gradient Boosting)
-    # ==========================================================================
-    logger.info("Training Baseline 2: XGBoost Gradient Boosting Classifier...")
+    # We train XGBoost first directly on slices; hist tree uses minimal RAM and supports NaNs natively!
+    logger.info("Training Model 1: XGBoost Gradient Boosting Classifier (Histogram Engine)...")
     xgb_params = cfg.get("models", {}).get("xgboost", {})
     xgb_model = xgb.XGBClassifier(
         n_estimators=xgb_params.get("n_estimators", 300),
@@ -506,17 +485,72 @@ def train_and_evaluate_baselines(
         random_state=seed,
         n_jobs=-1,
     )
-    
+
+    X_train_xgb = feature_matrix.loc[train_mask, feature_cols]
+    X_val_xgb = feature_matrix.loc[val_mask, feature_cols]
+    X_test_xgb = feature_matrix.loc[test_mask, feature_cols]
+
     xgb_model.fit(
-        X_train_imp, y_train,
-        eval_set=[(X_val_imp, y_val)],
+        X_train_xgb, y_train,
+        eval_set=[(X_val_xgb, y_val)],
         verbose=False,
     )
-    xgb_probs = xgb_model.predict_proba(X_test_imp)[:, 1]
-    
+    xgb_probs = xgb_model.predict_proba(X_test_xgb)[:, 1]
     results_dict["XGBoost"] = (y_test, xgb_probs)
     xgb_metrics = compute_clinical_metrics(y_test, xgb_probs, model_name="XGBoost")
     metrics_summary.append(xgb_metrics)
+    logger.info(f"XGBoost Classifier — AUROC: {xgb_metrics['AUROC']:.3f} | AUPRC: {xgb_metrics['AUPRC']:.3f} | F1: {xgb_metrics['F1_Score']:.3f}")
+
+    del X_val_xgb
+    gc.collect()
+
+    # ==========================================================================
+    # Model 2: Logistic Regression (L2 Regularized with Memory-Safe Subsampling)
+    # ==========================================================================
+    logger.info("Training Model 2: Regularized Logistic Regression...")
+    # On large cohorts (>200k rows), fit Logistic Regression on a representative stratified subsample
+    # to avoid 16GB+ memory allocation during dense StandardScaler / Hessian calculation
+    max_lr_train_rows = 150000
+    if len(y_train) > max_lr_train_rows:
+        logger.info(f"⚡ Memory Guard: Subsampling {max_lr_train_rows:,} rows from training set for Logistic Regression...")
+        rng = np.random.default_rng(seed)
+        sub_indices = rng.choice(len(y_train), size=max_lr_train_rows, replace=False)
+        X_train_lr = X_train_xgb.iloc[sub_indices]
+        y_train_lr = y_train[sub_indices]
+    else:
+        X_train_lr = X_train_xgb
+        y_train_lr = y_train
+
+    # In-place median imputation for linear model (computes medians on train slice)
+    col_medians = X_train_lr.median().astype(np.float32)
+    X_train_lr_imp = X_train_lr.fillna(col_medians).values.astype(np.float32)
+    X_test_lr_imp = X_test_xgb.fillna(col_medians).values.astype(np.float32)
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_lr_imp)
+    X_test_scaled = scaler.transform(X_test_lr_imp)
+
+    del X_train_lr, X_train_lr_imp, X_test_lr_imp, X_train_xgb
+    gc.collect()
+
+    lr_model = LogisticRegression(
+        penalty="l2",
+        C=0.1,
+        solver="lbfgs",
+        max_iter=1000,
+        class_weight="balanced",
+        random_state=seed,
+    )
+    lr_model.fit(X_train_scaled, y_train_lr)
+    lr_probs = lr_model.predict_proba(X_test_scaled)[:, 1]
+
+    results_dict["Logistic Regression"] = (y_test, lr_probs)
+    lr_metrics = compute_clinical_metrics(y_test, lr_probs, model_name="Logistic Regression")
+    metrics_summary.append(lr_metrics)
+    logger.info(f"Logistic Regression — AUROC: {lr_metrics['AUROC']:.3f} | AUPRC: {lr_metrics['AUPRC']:.3f} | F1: {lr_metrics['F1_Score']:.3f}")
+
+    del X_train_scaled, X_test_scaled
+    gc.collect()
     logger.info(f"XGBoost Classifier — AUROC: {xgb_metrics['AUROC']:.3f} | AUPRC: {xgb_metrics['AUPRC']:.3f} | F1: {xgb_metrics['F1_Score']:.3f}")
 
     # ==========================================================================
@@ -551,7 +585,7 @@ def train_and_evaluate_baselines(
     models_dir.mkdir(parents=True, exist_ok=True)
     joblib.dump(lr_model, models_dir / "logistic_regression_baseline.joblib")
     joblib.dump(xgb_model, models_dir / "xgboost_baseline.joblib")
-    joblib.dump(imputer, models_dir / "feature_imputer.joblib")
+    joblib.dump(col_medians, models_dir / "feature_medians.joblib")
     joblib.dump(scaler, models_dir / "feature_scaler.joblib")
     logger.info(f"Saved model checkpoints and scalers to: {models_dir.resolve()}")
 
