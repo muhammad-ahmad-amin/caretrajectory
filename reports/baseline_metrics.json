@@ -1,0 +1,40 @@
+[
+  {
+    "model_name": "Logistic Regression",
+    "prevalence": 0.0203,
+    "AUROC": 1.0,
+    "AUPRC": 1.0,
+    "threshold": 0.956,
+    "Accuracy": 1.0,
+    "Balanced_Accuracy": 1.0,
+    "Sensitivity_Recall": 1.0,
+    "Specificity": 1.0,
+    "Precision_PPV": 1.0,
+    "F1_Score": 1.0,
+    "Brier_Score": 0.0007,
+    "PhysioNet_Utility": 1.0,
+    "TP": 21,
+    "FP": 0,
+    "TN": 1016,
+    "FN": 0
+  },
+  {
+    "model_name": "XGBoost",
+    "prevalence": 0.0203,
+    "AUROC": 0.9995,
+    "AUPRC": 0.9545,
+    "threshold": 0.5249,
+    "Accuracy": 0.999,
+    "Balanced_Accuracy": 0.9995,
+    "Sensitivity_Recall": 1.0,
+    "Specificity": 0.999,
+    "Precision_PPV": 0.9545,
+    "F1_Score": 0.9767,
+    "Brier_Score": 0.2257,
+    "PhysioNet_Utility": 0.9976,
+    "TP": 21,
+    "FP": 1,
+    "TN": 1015,
+    "FN": 0
+  }
+]
