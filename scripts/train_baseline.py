@@ -143,31 +143,71 @@ def generate_synthetic_icu_cohort(
 
 
 # ==============================================================================
-# 2. Data Loading Engine
+# 2. Multi-Dataset Loading Engine
 # ==============================================================================
-def load_raw_dataset(data_dir: str, max_files: Optional[int] = None) -> pd.DataFrame:
+def load_raw_dataset(
+    data_sources: Union[str, Path, List[Union[str, Path]]],
+    max_files: Optional[int] = None
+) -> pd.DataFrame:
     """
-    Loads raw PhysioNet PSV files from data_dir.
+    Robust multi-dataset loader:
+      - Accepts single directory, list of directories, or file paths
+      - Auto-detects delimiters (.psv with '|', .csv with ',')
+      - Tracks hospital/dataset source tag
+      - Displays progress via tqdm
     """
-    path = Path(data_dir)
-    psv_files = sorted(glob.glob(str(path / "*.psv")) + glob.glob(str(path / "**" / "*.psv")))
-    
-    if not psv_files:
-        raise FileNotFoundError(f"No .psv patient files found in directory: {data_dir}")
+    if isinstance(data_sources, (str, Path)):
+        sources = [Path(data_sources)]
+    else:
+        sources = [Path(s) for s in data_sources]
+
+    all_files: List[Tuple[Path, str]] = []
+    for src in sources:
+        if not src.exists():
+            logger.warning(f"Data source path does not exist: {src}")
+            continue
         
+        source_tag = src.name if src.is_dir() else src.parent.name
+        if src.is_dir():
+            found = sorted(list(src.glob("*.psv")) + list(src.glob("**/*.psv")) +
+                           list(src.glob("*.csv")) + list(src.glob("**/*.csv")))
+            for f in found:
+                all_files.append((f, source_tag))
+        elif src.is_file():
+            all_files.append((src, source_tag))
+
+    if not all_files:
+        raise FileNotFoundError(f"No .psv or .csv clinical patient files found across sources: {data_sources}")
+
     if max_files:
-        psv_files = psv_files[:max_files]
-        
-    logger.info(f"Loading {len(psv_files)} PhysioNet patient files from {data_dir}...")
+        all_files = all_files[:max_files]
+
+    logger.info(f"Discovered {len(all_files)} total patient files across {len(sources)} data source(s). Loading...")
+    
     patient_dfs = []
-    for f in psv_files:
-        pid = Path(f).stem
-        p_df = pd.read_csv(f, sep="|")
-        p_df["patient_id"] = pid
-        patient_dfs.append(p_df)
-        
+    from tqdm import tqdm
+    for fpath, src_tag in tqdm(all_files, desc="Ingesting Patient Records", unit="pt"):
+        pid = fpath.stem
+        # Auto-detect separator
+        sep = "|" if fpath.suffix.lower() == ".psv" else ","
+        try:
+            p_df = pd.read_csv(fpath, sep=sep, engine="c", low_memory=False)
+            p_df["patient_id"] = f"{src_tag}_{pid}"
+            p_df["hospital_source"] = src_tag
+            patient_dfs.append(p_df)
+        except Exception as e:
+            logger.debug(f"Failed to parse {fpath}: {e}")
+            continue
+
+    if not patient_dfs:
+        raise ValueError("Could not successfully read any patient files.")
+
     combined_df = pd.concat(patient_dfs, ignore_index=True)
-    logger.info(f"Loaded {len(patient_dfs)} patients ({len(combined_df)} hourly observations).")
+    logger.info(
+        f"Ingestion Complete: {len(patient_dfs)} patients loaded "
+        f"({len(combined_df):,} hourly clinical observations) across sources: "
+        f"{', '.join(set(combined_df['hospital_source'].unique()))}."
+    )
     return combined_df
 
 
@@ -176,16 +216,18 @@ def load_raw_dataset(data_dir: str, max_files: Optional[int] = None) -> pd.DataF
 # ==============================================================================
 def train_and_evaluate_baselines(
     config_path: str = "configs/base.yaml",
-    data_dir: Optional[str] = None,
+    data_dir: Optional[Union[str, List[str]]] = None,
     output_dir: str = "reports",
     use_synthetic: bool = False,
     n_synthetic_patients: int = 150,
+    max_files: Optional[int] = None,
+    cross_hospital_split: bool = False,
 ) -> Dict[str, Dict[str, Union[float, str]]]:
     """
     Executes end-to-end baseline training and evaluation:
-      1. Loads or synthesizes patient records
+      1. Loads single or multiple patient datasets (.psv or .csv)
       2. Extracts temporal rolling features (6h, 12h, 24h), deltas, clinical scores
-      3. Performs patient-level group split (prevents record leakage)
+      3. Performs patient-level group split or cross-hospital domain transfer split
       4. Trains Logistic Regression (balanced) and XGBoost (scale_pos_weight)
       5. Computes AUROC, AUPRC, F1, Brier, and PhysioNet Utility
       6. Generates publication-grade figures and markdown report
@@ -201,12 +243,12 @@ def train_and_evaluate_baselines(
     np.random.seed(seed)
 
     # 1. Dataset Acquisition
-    if use_synthetic or not data_dir or not Path(data_dir).exists():
+    if use_synthetic or not data_dir:
         logger.info("Initializing baseline training using synthesized high-fidelity ICU cohort...")
         raw_df = generate_synthetic_icu_cohort(n_patients=n_synthetic_patients, seed=seed)
     else:
-        logger.info(f"Reading patient records from drive storage: {data_dir}")
-        raw_df = load_raw_dataset(data_dir)
+        logger.info(f"Reading patient records from data source(s): {data_dir}")
+        raw_df = load_raw_dataset(data_dir, max_files=max_files)
 
     # 2. Feature Engineering
     logger.info("Starting temporal feature engineering pipeline...")
@@ -223,6 +265,10 @@ def train_and_evaluate_baselines(
     )
     feature_matrix = extractor.transform(raw_df)
 
+    # Preserve hospital source if available
+    if "hospital_source" in raw_df.columns:
+        feature_matrix["hospital_source"] = raw_df["hospital_source"].values
+
     feature_cols = extractor.feature_names_
     target_col = "SepsisLabel"
     patient_id_col = "patient_id"
@@ -231,18 +277,36 @@ def train_and_evaluate_baselines(
     y = feature_matrix[target_col].values.astype(int)
     groups = feature_matrix[patient_id_col].values
 
-    # 3. Patient-Level Train/Validation/Test Split
-    logger.info(f"Executing patient-level GroupShuffleSplit on '{patient_id_col}'...")
-    gss_test = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=seed)
-    train_val_idx, test_idx = next(gss_test.split(X, y, groups=groups))
+    # 3. Train/Validation/Test Partitioning
+    hospitals = feature_matrix.get("hospital_source", None)
+    if cross_hospital_split and hospitals is not None and len(hospitals.unique()) >= 2:
+        unique_hosp = sorted(hospitals.unique())
+        train_hosp = unique_hosp[0]
+        test_hosp = unique_hosp[1]
+        logger.info(f"Cross-Hospital Domain Transfer: Training on '{train_hosp}', Testing on '{test_hosp}'")
+        
+        train_val_mask = (hospitals == train_hosp).values
+        test_mask = (hospitals == test_hosp).values
+        
+        X_train_val = X.iloc[train_val_mask]
+        y_train_val = y[train_val_mask]
+        groups_train_val = groups[train_val_mask]
+        
+        X_test = X.iloc[test_mask]
+        y_test = y[test_mask]
+        groups_test = groups[test_mask]
+    else:
+        logger.info(f"Executing patient-level GroupShuffleSplit on '{patient_id_col}'...")
+        gss_test = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=seed)
+        train_val_idx, test_idx = next(gss_test.split(X, y, groups=groups))
 
-    X_train_val = X.iloc[train_val_idx]
-    y_train_val = y[train_val_idx]
-    groups_train_val = groups[train_val_idx]
+        X_train_val = X.iloc[train_val_idx]
+        y_train_val = y[train_val_idx]
+        groups_train_val = groups[train_val_idx]
 
-    X_test = X.iloc[test_idx]
-    y_test = y[test_idx]
-    groups_test = groups[test_idx]
+        X_test = X.iloc[test_idx]
+        y_test = y[test_idx]
+        groups_test = groups[test_idx]
 
     # Split train and validation for early stopping
     gss_val = GroupShuffleSplit(n_splits=1, test_size=0.15, random_state=seed)
@@ -372,12 +436,23 @@ def train_and_evaluate_baselines(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="CareTrajectory Baseline Training & Benchmark Runner")
+    parser = argparse.ArgumentParser(
+        description="CareTrajectory Baseline Training & Benchmark Runner",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("--config", type=str, default="configs/base.yaml", help="Path to YAML configuration")
-    parser.add_argument("--data_dir", type=str, default=None, help="Directory containing raw patient PSV files")
+    parser.add_argument(
+        "--data_dir", nargs="+", default=None,
+        help="One or more directories containing raw patient PSV or CSV files (e.g., data/setA data/setB)"
+    )
     parser.add_argument("--output_dir", type=str, default="reports", help="Output directory for reports & figures")
     parser.add_argument("--use_synthetic", action="store_true", help="Force execution on synthetic ICU cohort")
     parser.add_argument("--n_patients", type=int, default=150, help="Number of synthetic patients if synthesizing")
+    parser.add_argument("--max_files", type=int, default=None, help="Optional maximum number of patient files to load for quick trial")
+    parser.add_argument(
+        "--cross_hospital", action="store_true",
+        help="Enable cross-hospital domain transfer evaluation (train on hospital A, test on hospital B)"
+    )
     
     args = parser.parse_args()
     train_and_evaluate_baselines(
@@ -386,4 +461,6 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         use_synthetic=args.use_synthetic,
         n_synthetic_patients=args.n_patients,
+        max_files=args.max_files,
+        cross_hospital_split=args.cross_hospital,
     )

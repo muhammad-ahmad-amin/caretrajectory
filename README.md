@@ -67,10 +67,29 @@ Activate the pre-configured virtual environment:
 source venv/bin/activate
 ```
 
-### 2. Run Pipeline with Google Drive Dataset
-When running on the real PhysioNet 2019 dataset from Drive (e.g., extracted into `data/physionet_2019`):
+### 2. Run Pipeline with Google Drive Dataset(s)
+
+#### A. Single Dataset / Folder
 ```bash
 python scripts/train_baseline.py --data_dir data/physionet_2019 --config configs/base.yaml
+```
+
+#### B. Multiple Datasets / Multi-Hospital Folders (e.g. Set A and Set B)
+You can pass multiple directories simultaneously. The pipeline will automatically ingest both, attach hospital tags, and perform a patient-level split:
+```bash
+python scripts/train_baseline.py --data_dir data/training_setA data/training_setB --config configs/base.yaml
+```
+
+#### C. Cross-Hospital Domain Transfer Evaluation
+To train on Hospital A and test on Hospital B (zero-shot generalizability):
+```bash
+python scripts/train_baseline.py --data_dir data/training_setA data/training_setB --cross_hospital --config configs/base.yaml
+```
+
+#### D. Fast Verification on Real Data (Subset of Patients)
+If you want to test on a quick subset (e.g. 500 patient files) before running all 40,000 files:
+```bash
+python scripts/train_baseline.py --data_dir data/training_setA --max_files 500
 ```
 
 ### 3. Run Pipeline in Synthetic / Simulation Mode
