@@ -172,6 +172,26 @@ class TestTemporalFeatureExtractor(unittest.TestCase):
         float_cols = transformed.select_dtypes(include=["float64"]).columns
         self.assertEqual(len(float_cols), 0, "All float columns must be float32 for RAM efficiency.")
 
+    def test_checkpoint_parquet_save_and_resume(self):
+        """Verify feature matrix saves to and resumes from Parquet checkpoint without loss."""
+        import tempfile
+        transformed = self.extractor.transform(self.test_data)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chk_path = Path(tmpdir) / "test_features.parquet"
+            transformed.to_parquet(chk_path, index=False)
+            self.assertTrue(chk_path.exists())
+            
+            # Read back checkpoint
+            resumed_df = pd.read_parquet(chk_path)
+            self.assertEqual(len(resumed_df), len(transformed))
+            self.assertEqual(list(resumed_df.columns), list(transformed.columns))
+            # Check values match
+            np.testing.assert_allclose(
+                resumed_df["HR_mean_3h"].values,
+                transformed["HR_mean_3h"].values,
+                rtol=1e-5
+            )
+
 
 class TestEvaluationSuite(unittest.TestCase):
     """Unit tests for clinical metrics and threshold optimization."""

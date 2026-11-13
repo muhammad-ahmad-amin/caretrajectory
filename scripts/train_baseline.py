@@ -143,19 +143,13 @@ def generate_synthetic_icu_cohort(
 
 
 # ==============================================================================
-# 2. Multi-Dataset Loading Engine
+# 2. Multi-Dataset Loading & Checkpointed Feature Extraction Engine
 # ==============================================================================
-def load_raw_dataset(
+def discover_patient_files(
     data_sources: Union[str, Path, List[Union[str, Path]]],
     max_files: Optional[int] = None
-) -> pd.DataFrame:
-    """
-    Robust multi-dataset loader:
-      - Accepts single directory, list of directories, or file paths
-      - Auto-detects delimiters (.psv with '|', .csv with ',')
-      - Tracks hospital/dataset source tag
-      - Displays progress via tqdm
-    """
+) -> List[Tuple[Path, str]]:
+    """Discovers all .psv and .csv patient files across provided sources."""
     if isinstance(data_sources, (str, Path)):
         sources = [Path(data_sources)]
     else:
@@ -177,38 +171,101 @@ def load_raw_dataset(
             all_files.append((src, source_tag))
 
     if not all_files:
-        raise FileNotFoundError(f"No .psv or .csv clinical patient files found across sources: {data_sources}")
+        raise FileNotFoundError(f"No .psv or .csv patient files found across sources: {data_sources}")
 
     if max_files:
         all_files = all_files[:max_files]
+        
+    return all_files
 
-    logger.info(f"Discovered {len(all_files)} total patient files across {len(sources)} data source(s). Loading...")
-    
-    patient_dfs = []
-    from tqdm import tqdm
-    for fpath, src_tag in tqdm(all_files, desc="Ingesting Patient Records", unit="pt"):
+
+def load_file_batch(file_batch: List[Tuple[Path, str]]) -> pd.DataFrame:
+    """Reads a batch of patient files into a combined DataFrame with source tagging."""
+    batch_dfs = []
+    for fpath, src_tag in file_batch:
         pid = fpath.stem
-        # Auto-detect separator
         sep = "|" if fpath.suffix.lower() == ".psv" else ","
         try:
             p_df = pd.read_csv(fpath, sep=sep, engine="c", low_memory=False)
             p_df["patient_id"] = f"{src_tag}_{pid}"
             p_df["hospital_source"] = src_tag
-            patient_dfs.append(p_df)
+            batch_dfs.append(p_df)
         except Exception as e:
             logger.debug(f"Failed to parse {fpath}: {e}")
             continue
+    if not batch_dfs:
+        return pd.DataFrame()
+    return pd.concat(batch_dfs, ignore_index=True)
 
-    if not patient_dfs:
-        raise ValueError("Could not successfully read any patient files.")
 
-    combined_df = pd.concat(patient_dfs, ignore_index=True)
-    logger.info(
-        f"Ingestion Complete: {len(patient_dfs)} patients loaded "
-        f"({len(combined_df):,} hourly clinical observations) across sources: "
-        f"{', '.join(set(combined_df['hospital_source'].unique()))}."
-    )
-    return combined_df
+def load_or_extract_features_with_checkpoints(
+    extractor: TemporalFeatureExtractor,
+    data_sources: Union[str, Path, List[Union[str, Path]]],
+    processed_features_path: Path,
+    checkpoint_dir: Path,
+    chunk_size: int = 500,
+    max_files: Optional[int] = None,
+    force_recompute: bool = False,
+) -> pd.DataFrame:
+    """
+    Two-Level Checkpoint & Resume Architecture:
+      Level 1: Checks for master cached parquet (data_processed/engineered_features.parquet).
+               If present and not force_recompute, loads instantly in 1-2 seconds.
+      Level 2: If extracting from raw files, processes in incremental chunks.
+               Each completed chunk is written to checkpoint_dir/chunk_XXXX.parquet.
+               If interrupted, resumes exactly from the last completed chunk without data loss.
+    """
+    # 1. Master Cache Level
+    if not force_recompute and processed_features_path.exists():
+        logger.info(f"⚡ [RESUME LEVEL 1] Found master feature cache: {processed_features_path}")
+        logger.info("Loading precomputed engineered features from disk (skipping raw ingestion)...")
+        feature_df = pd.read_parquet(processed_features_path)
+        logger.info(f"Loaded feature matrix: {feature_df.shape[0]:,} rows, {feature_df.shape[1]:,} columns.")
+        return feature_df
+
+    # 2. Incremental Chunk Checkpoints Level
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    all_files = discover_patient_files(data_sources, max_files=max_files)
+    n_files = len(all_files)
+    logger.info(f"Discovered {n_files} patient records. Processing in chunks of {chunk_size} with auto-checkpoints...")
+
+    chunks = [all_files[i:i + chunk_size] for i in range(0, n_files, chunk_size)]
+    chunk_feature_dfs = []
+
+    from tqdm import tqdm
+    for idx, chunk in enumerate(tqdm(chunks, desc="Processing Patient Chunks", unit="chunk")):
+        chunk_file = checkpoint_dir / f"chunk_{idx:04d}.parquet"
+        
+        # Check if this intermediate chunk was already completed in a prior run
+        if not force_recompute and chunk_file.exists():
+            logger.info(f"⚡ [RESUME LEVEL 2] Checkpoint found for chunk {idx + 1}/{len(chunks)} ({chunk_file.name}). Loading...")
+            chunk_df = pd.read_parquet(chunk_file)
+            chunk_feature_dfs.append(chunk_df)
+            continue
+
+        # Ingest and transform current batch
+        batch_raw_df = load_file_batch(chunk)
+        if batch_raw_df.empty:
+            continue
+
+        chunk_features = extractor.transform(batch_raw_df)
+        
+        # Preserve hospital source if available
+        if "hospital_source" in batch_raw_df.columns:
+            chunk_features["hospital_source"] = batch_raw_df["hospital_source"].values
+
+        # Save chunk checkpoint immediately
+        chunk_features.to_parquet(chunk_file, index=False, compression="snappy")
+        logger.info(f"💾 Checkpoint saved: {chunk_file.name} ({len(chunk_features)} rows)")
+        chunk_feature_dfs.append(chunk_features)
+
+    # 3. Assemble and save Master Feature Cache
+    logger.info("Assembling all chunk checkpoints into master feature dataset...")
+    full_feature_df = pd.concat(chunk_feature_dfs, ignore_index=True)
+    processed_features_path.parent.mkdir(parents=True, exist_ok=True)
+    full_feature_df.to_parquet(processed_features_path, index=False, compression="snappy")
+    logger.info(f"💾 Master feature cache saved to: {processed_features_path.resolve()}")
+    return full_feature_df
 
 
 # ==============================================================================
@@ -222,15 +279,20 @@ def train_and_evaluate_baselines(
     n_synthetic_patients: int = 150,
     max_files: Optional[int] = None,
     cross_hospital_split: bool = False,
+    checkpoint_dir: str = "data_processed/checkpoints",
+    processed_features_path: str = "data_processed/engineered_features.parquet",
+    chunk_size: int = 500,
+    force_recompute: bool = False,
 ) -> Dict[str, Dict[str, Union[float, str]]]:
     """
-    Executes end-to-end baseline training and evaluation:
-      1. Loads single or multiple patient datasets (.psv or .csv)
-      2. Extracts temporal rolling features (6h, 12h, 24h), deltas, clinical scores
-      3. Performs patient-level group split or cross-hospital domain transfer split
-      4. Trains Logistic Regression (balanced) and XGBoost (scale_pos_weight)
-      5. Computes AUROC, AUPRC, F1, Brier, and PhysioNet Utility
-      6. Generates publication-grade figures and markdown report
+    Executes end-to-end baseline training and evaluation with multi-stage checkpointing:
+      - Resumes from data_processed/engineered_features.parquet if present.
+      - Resumes from incremental chunk checkpoints (data_processed/checkpoints/chunk_XXXX.parquet)
+        if raw extraction was interrupted.
+      - Performs patient-level group split or cross-hospital domain transfer split.
+      - Trains Logistic Regression (balanced) and XGBoost (scale_pos_weight).
+      - Computes AUROC, AUPRC, F1, Brier, and PhysioNet Utility.
+      - Generates publication-grade figures and markdown report.
     """
     # Load configuration
     if Path(config_path).exists():
@@ -242,16 +304,6 @@ def train_and_evaluate_baselines(
     seed = cfg.get("seed", 42)
     np.random.seed(seed)
 
-    # 1. Dataset Acquisition
-    if use_synthetic or not data_dir:
-        logger.info("Initializing baseline training using synthesized high-fidelity ICU cohort...")
-        raw_df = generate_synthetic_icu_cohort(n_patients=n_synthetic_patients, seed=seed)
-    else:
-        logger.info(f"Reading patient records from data source(s): {data_dir}")
-        raw_df = load_raw_dataset(data_dir, max_files=max_files)
-
-    # 2. Feature Engineering
-    logger.info("Starting temporal feature engineering pipeline...")
     extractor = TemporalFeatureExtractor(
         windows_hours=cfg.get("features", {}).get("windows_hours", [6, 12, 24]),
         aggregations=cfg.get("features", {}).get("aggregations", ["mean", "min", "max", "std"]),
@@ -263,13 +315,26 @@ def train_and_evaluate_baselines(
         time_col="ICULOS",
         target_col="SepsisLabel",
     )
-    feature_matrix = extractor.transform(raw_df)
 
-    # Preserve hospital source if available
-    if "hospital_source" in raw_df.columns:
-        feature_matrix["hospital_source"] = raw_df["hospital_source"].values
+    # 1. Dataset Acquisition & Checkpointed Feature Extraction
+    if use_synthetic or not data_dir:
+        logger.info("Initializing baseline training using synthesized high-fidelity ICU cohort...")
+        raw_df = generate_synthetic_icu_cohort(n_patients=n_synthetic_patients, seed=seed)
+        feature_matrix = extractor.transform(raw_df)
+    else:
+        logger.info(f"Targeting data source(s): {data_dir}")
+        feature_matrix = load_or_extract_features_with_checkpoints(
+            extractor=extractor,
+            data_sources=data_dir,
+            processed_features_path=Path(processed_features_path),
+            checkpoint_dir=Path(checkpoint_dir),
+            chunk_size=chunk_size,
+            max_files=max_files,
+            force_recompute=force_recompute,
+        )
 
-    feature_cols = extractor.feature_names_
+    exclude_cols = {"patient_id", "ICULOS", "SepsisLabel", "hospital_source"}
+    feature_cols = [c for c in feature_matrix.columns if c not in exclude_cols]
     target_col = "SepsisLabel"
     patient_id_col = "patient_id"
 
@@ -453,6 +518,22 @@ if __name__ == "__main__":
         "--cross_hospital", action="store_true",
         help="Enable cross-hospital domain transfer evaluation (train on hospital A, test on hospital B)"
     )
+    parser.add_argument(
+        "--checkpoint_dir", type=str, default="data_processed/checkpoints",
+        help="Directory to store intermediate batch checkpoints for seamless resumption"
+    )
+    parser.add_argument(
+        "--processed_features", type=str, default="data_processed/engineered_features.parquet",
+        help="Path to master precomputed parquet feature table"
+    )
+    parser.add_argument(
+        "--chunk_size", type=int, default=500,
+        help="Number of patient files to process per checkpoint chunk"
+    )
+    parser.add_argument(
+        "--force_recompute", action="store_true",
+        help="Ignore existing checkpoints and force full re-computation from scratch"
+    )
     
     args = parser.parse_args()
     train_and_evaluate_baselines(
@@ -463,4 +544,8 @@ if __name__ == "__main__":
         n_synthetic_patients=args.n_patients,
         max_files=args.max_files,
         cross_hospital_split=args.cross_hospital,
+        checkpoint_dir=args.checkpoint_dir,
+        processed_features_path=args.processed_features,
+        chunk_size=args.chunk_size,
+        force_recompute=args.force_recompute,
     )

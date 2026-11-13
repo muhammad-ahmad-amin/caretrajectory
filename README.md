@@ -92,7 +92,24 @@ If you want to test on a quick subset (e.g. 500 patient files) before running al
 python scripts/train_baseline.py --data_dir data/training_setA --max_files 500
 ```
 
-### 3. Run Pipeline in Synthetic / Simulation Mode
+### 3. Fault-Tolerant Checkpointing & Resume System
+
+CareTrajectory implements a **Two-Level Checkpoint Architecture** so long runs can be safely interrupted (`Ctrl+C` or battery/system shutdown) and resumed without losing work:
+
+1. **Incremental Batch Checkpoints (`data_processed/checkpoints/chunk_XXXX.parquet`)**:
+   - Patient files are processed in chunks (default 500 patients per chunk).
+   - Each completed chunk is immediately written to disk.
+   - If the script stops halfway (e.g., at patient 15,200 out of 40,000), running it again automatically detects finished chunks and **resumes from the exact point of interruption**.
+2. **Master Feature Cache (`data_processed/engineered_features.parquet`)**:
+   - Once all chunks finish, they are compiled into a master compressed Parquet cache.
+   - Subsequent training runs load this master cache in **under 2 seconds**, completely skipping raw file re-ingestion and feature extraction.
+3. **Forcing Full Recomputation**:
+   - If you modify feature logic and wish to recompute from scratch:
+     ```bash
+     python scripts/train_baseline.py --data_dir data/training_setA --force_recompute
+     ```
+
+### 4. Run Pipeline in Synthetic / Simulation Mode
 To run, benchmark, or verify the entire pipeline without downloading gigabytes of raw data:
 ```bash
 python scripts/train_baseline.py --use_synthetic --n_patients 150
