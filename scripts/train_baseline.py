@@ -1310,6 +1310,9 @@ def train_and_evaluate_baselines(
         .astype(np.float32)
     )
 
+    X_train_lr = np.nan_to_num(X_train_lr, nan=0.0, posinf=0.0, neginf=0.0)
+    X_val_lr = np.nan_to_num(X_val_lr, nan=0.0, posinf=0.0, neginf=0.0)
+    X_test_lr = np.nan_to_num(X_test_lr, nan=0.0, posinf=0.0, neginf=0.0)
     scaler = StandardScaler()
 
     X_train_scaled = (
