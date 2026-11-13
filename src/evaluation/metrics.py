@@ -129,15 +129,29 @@ def compute_clinical_metrics(
     y_prob = np.asarray(y_prob).astype(np.float64)
     
     # 1. Discrimination (Threshold-Independent)
-    try:
-        auroc = float(roc_auc_score(y_true, y_prob))
-    except Exception:
+    n_classes = len(np.unique(y_true))
+    if n_classes < 2:
+        logger.warning(
+            f"Evaluation target for {model_name} contains only 1 class "
+            f"(pos={np.sum(y_true == 1)}, neg={np.sum(y_true == 0)}). "
+            "AUROC and AUPRC defaulted to baseline."
+        )
         auroc = 0.5
-        
-    try:
-        auprc = float(average_precision_score(y_true, y_prob))
-    except Exception:
         auprc = float(np.mean(y_true))
+    else:
+        try:
+            auroc = float(roc_auc_score(y_true, y_prob))
+            if np.isnan(auroc):
+                auroc = 0.5
+        except Exception:
+            auroc = 0.5
+            
+        try:
+            auprc = float(average_precision_score(y_true, y_prob))
+            if np.isnan(auprc):
+                auprc = float(np.mean(y_true))
+        except Exception:
+            auprc = float(np.mean(y_true))
 
     # 2. Threshold-Dependent Metrics
     if threshold is None:
@@ -418,7 +432,16 @@ def save_metrics_report(
     ]
     cols = [c for c in cols_order if c in df_metrics.columns]
     
-    md_table = df_metrics[cols].to_markdown(index=False)
+    try:
+        md_table = df_metrics[cols].to_markdown(index=False)
+    except Exception:
+        # Fallback pure-python markdown table generation (no tabulate dependency needed)
+        header = "| " + " | ".join(cols) + " |"
+        sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+        rows = []
+        for _, row in df_metrics[cols].iterrows():
+            rows.append("| " + " | ".join(str(row[c]) for c in cols) + " |")
+        md_table = "\n".join([header, sep] + rows)
     
     with open(md_path, "w", encoding="utf-8") as f:
         f.write("# CareTrajectory — Baseline Model Benchmark Report\n\n")

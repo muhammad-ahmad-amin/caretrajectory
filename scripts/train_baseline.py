@@ -926,46 +926,48 @@ def train_and_evaluate_baselines(
 
     else:
 
-        unique_pids = np.unique(
-            patient_ids
+        # Stratified Patient-Level Partitioning
+        # Ensures deteriorating patients are proportionally distributed across splits
+        patient_max_label = (
+            feature_matrix
+            .groupby(patient_id_col)[target_col]
+            .max()
         )
+        pos_pids = patient_max_label[patient_max_label > 0].index.to_numpy()
+        neg_pids = patient_max_label[patient_max_label == 0].index.to_numpy()
 
         np.random.seed(seed)
+        np.random.shuffle(pos_pids)
+        np.random.shuffle(neg_pids)
 
-        np.random.shuffle(
-            unique_pids
-        )
+        def _split_pids(pids, train_ratio=0.70, val_ratio=0.15):
+            n = len(pids)
+            if n == 0:
+                return [], [], []
+            if n == 1:
+                return list(pids), [], []
+            if n == 2:
+                return [pids[0]], [], [pids[1]]
+            n_tr = max(1, int(n * train_ratio))
+            n_va = max(1, int(n * val_ratio))
+            if n_tr + n_va >= n:
+                n_tr = max(1, n - 2)
+                n_va = 1
+            n_te = n - (n_tr + n_va)
+            if n_te <= 0 and n >= 3:
+                n_te = 1
+                if n_tr > 1:
+                    n_tr -= 1
+                else:
+                    n_va = max(0, n_va - 1)
+            return list(pids[:n_tr]), list(pids[n_tr:n_tr + n_va]), list(pids[n_tr + n_va:])
 
-        n_total_pts = len(
-            unique_pids
-        )
+        pos_train, pos_val, pos_test = _split_pids(pos_pids, 0.70, 0.15)
+        neg_train, neg_val, neg_test = _split_pids(neg_pids, 0.70, 0.15)
 
-        n_train_pts = int(
-            n_total_pts * 0.70
-        )
-
-        n_val_pts = int(
-            n_total_pts * 0.15
-        )
-
-        train_pids = set(
-            unique_pids[
-                :n_train_pts
-            ]
-        )
-
-        val_pids = set(
-            unique_pids[
-                n_train_pts:
-                n_train_pts + n_val_pts
-            ]
-        )
-
-        test_pids = set(
-            unique_pids[
-                n_train_pts + n_val_pts:
-            ]
-        )
+        train_pids = set(pos_train + neg_train)
+        val_pids = set(pos_val + neg_val)
+        test_pids = set(pos_test + neg_test)
 
         pid_series = pd.Series(
             patient_ids
@@ -1176,15 +1178,28 @@ def train_and_evaluate_baselines(
     # Train XGBoost
     # --------------------------------------------------------------------------
 
-    xgb_model.fit(
-        X_train_xgb,
-        y_train_xgb,
-        eval_set=[
+    has_val_pos = bool(np.sum(y_val == 1) > 0)
+    has_val_neg = bool(np.sum(y_val == 0) > 0)
+
+    if has_val_pos and has_val_neg:
+        eval_set = [
             (
                 X_val_xgb,
                 y_val
             )
-        ],
+        ]
+    else:
+        eval_set = None
+        xgb_model.set_params(early_stopping_rounds=None)
+        logger.warning(
+            "Validation set does not contain both classes; "
+            "early stopping disabled for this run."
+        )
+
+    xgb_model.fit(
+        X_train_xgb,
+        y_train_xgb,
+        eval_set=eval_set,
         verbose=False,
     )
 
@@ -1310,9 +1325,9 @@ def train_and_evaluate_baselines(
         .astype(np.float32)
     )
 
-    X_train_lr = np.nan_to_num(X_train_lr, nan=0.0, posinf=0.0, neginf=0.0)
-    X_val_lr = np.nan_to_num(X_val_lr, nan=0.0, posinf=0.0, neginf=0.0)
-    X_test_lr = np.nan_to_num(X_test_lr, nan=0.0, posinf=0.0, neginf=0.0)
+    # Sanitize NaNs and infinite values directly on the numpy arrays before scaling
+    X_train_lr_imp = np.nan_to_num(X_train_lr_imp, nan=0.0, posinf=0.0, neginf=0.0)
+    X_test_lr_imp = np.nan_to_num(X_test_lr_imp, nan=0.0, posinf=0.0, neginf=0.0)
     scaler = StandardScaler()
 
     X_train_scaled = (
